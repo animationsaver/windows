@@ -1,0 +1,72 @@
+name: Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Minutes to keep the session alive (max ~350 / 6h limit)"
+        required: false
+        default: "60"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360   # GitHub Actions hard limit (6 hours)
+    steps:
+      - name: Set RDP password
+        shell: powershell
+        run: |
+          $pw = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $pw
+          Write-Host "runneradmin password set"
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Uncomment only if you cannot connect due to NLA:
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Write-Host "RDP enabled"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
+          Write-Host "Tailscale installed"
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey="${{ secrets.TS_AUTHKEY }}" --hostname="gha-windows-rdp" --accept-routes --unattended
+          Start-Sleep -Seconds 5
+          $ip = & $ts ip -4
+          Write-Host "=================================================="
+          Write-Host "  Tailscale IP : $ip"
+          Write-Host "  Connect via RDP as user: runneradmin"
+          Write-Host "=================================================="
+
+      - name: Keep session alive
+        shell: powershell
+        run: |
+          $minutes = [int]"${{ github.event.inputs.session_minutes }}"
+          if ($minutes -le 0) { $minutes = 60 }
+          $deadline = (Get-Date).AddMinutes($minutes)
+          Write-Host "Keeping session for $minutes minutes (until $deadline)"
+          Write-Host "Create stop.txt on the Desktop to end early"
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\stop.txt") {
+              Write-Host "stop.txt detected. Ending."
+              break
+            }
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Tailscale logout
+        if: always()
+        shell: powershell
+        run: |
+          & "C:\Program Files\Tailscale\tailscale.exe" logout
+          Write-Host "Cleanup done"
