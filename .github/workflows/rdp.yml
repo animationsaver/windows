@@ -48,6 +48,18 @@ jobs:
           Write-Host "  Connect via RDP as user: runneradmin"
           Write-Host "=================================================="
 
+      - name: Add Japanese input (Microsoft IME)
+        shell: powershell
+        run: |
+          # Keep English UI, but add Japanese so the Microsoft IME is available.
+          $list = New-WinUserLanguageList -Language en-US
+          $list.Add("ja-JP")
+          Set-WinUserLanguageList -LanguageList $list -Force
+          # Refresh the input switcher for the current desktop session (best-effort)
+          Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+          Start-Process explorer.exe
+          Write-Host "Japanese (Microsoft IME) added. Switch input with Win+Space or Alt+Shift."
+
       - name: Keep session alive
         shell: powershell
         run: |
@@ -68,5 +80,10 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          & "C:\Program Files\Tailscale\tailscale.exe" logout
-          Write-Host "Cleanup done"
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout
+            Write-Host "Cleanup done"
+          } else {
+            Write-Host "Tailscale not installed; skipping logout"
+          }
