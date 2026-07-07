@@ -7,6 +7,8 @@ on:
         description: "Minutes to keep the session alive (max ~350 / 6h limit)"
         required: false
         default: "350"
+  repository_dispatch:
+    types: [start-rdp]
 
 jobs:
   rdp:
@@ -36,6 +38,28 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
           Write-Host "Tailscale installed"
 
+      - name: Remove stale Tailscale device
+        shell: powershell
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_API_KEY)) {
+            Write-Host "TS_API_KEY not set; skipping stale-device cleanup"
+          } else {
+            $headers = @{ Authorization = "Bearer $env:TS_API_KEY" }
+            try {
+              $resp = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" -Headers $headers
+              foreach ($d in $resp.devices) {
+                if (($d.hostname -like "gha-windows-rdp*") -or ($d.name -like "gha-windows-rdp*")) {
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $headers
+                  Write-Host "Deleted stale device: $($d.name)"
+                }
+              }
+            } catch {
+              Write-Host "Cleanup failed: $($_.Exception.Message)"
+            }
+          }
+
       - name: Connect Tailscale
         shell: powershell
         run: |
@@ -62,8 +86,10 @@ jobs:
 
       - name: Keep session alive
         shell: powershell
+        env:
+          SESSION_MINUTES: "${{ github.event.inputs.session_minutes || github.event.client_payload.minutes || '350' }}"
         run: |
-          $minutes = [int]"${{ github.event.inputs.session_minutes }}"
+          $minutes = [int]"$env:SESSION_MINUTES"
           if ($minutes -le 0) { $minutes = 60 }
           $deadline = (Get-Date).AddMinutes($minutes)
           Write-Host "Keeping session for $minutes minutes (until $deadline)"
@@ -76,14 +102,31 @@ jobs:
             Start-Sleep -Seconds 30
           }
 
-      - name: Tailscale logout
+      - name: Tailscale logout and remove device
         if: always()
         shell: powershell
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           if (Test-Path $ts) {
             & $ts logout
-            Write-Host "Cleanup done"
+            Write-Host "Logged out"
           } else {
             Write-Host "Tailscale not installed; skipping logout"
+          }
+          # Also remove the node from the tailnet so the hostname is freed (no -1 next run)
+          if (-not [string]::IsNullOrWhiteSpace($env:TS_API_KEY)) {
+            $headers = @{ Authorization = "Bearer $env:TS_API_KEY" }
+            try {
+              $resp = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" -Headers $headers
+              foreach ($d in $resp.devices) {
+                if (($d.hostname -like "gha-windows-rdp*") -or ($d.name -like "gha-windows-rdp*")) {
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $headers
+                  Write-Host "Removed device from tailnet: $($d.name)"
+                }
+              }
+            } catch {
+              Write-Host "Device removal failed: $($_.Exception.Message)"
+            }
           }
