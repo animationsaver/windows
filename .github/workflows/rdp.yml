@@ -6,7 +6,7 @@ on:
       session_minutes:
         description: "Minutes to keep the session alive (max ~350 / 6h limit)"
         required: false
-        default: "60"
+        default: "350"
 
 jobs:
   rdp:
