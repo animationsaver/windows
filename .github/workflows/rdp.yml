@@ -72,6 +72,22 @@ jobs:
           Write-Host "  Connect via RDP as user: runneradmin"
           Write-Host "=================================================="
 
+      - name: Enable WebAuthn redirection (passkey over RDP)
+        shell: powershell
+        run: |
+          # Host-side policy: allow WebAuthn (FIDO2 / Windows Hello) redirection into the session.
+          # Group Policy: Computer Config > Admin Templates > Windows Components >
+          #   Remote Desktop Services > RD Session Host > Device and Resource Redirection >
+          #   "Do not allow WebAuthn redirection" = Disabled  (i.e. redirection allowed)
+          $tsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $tsPolicy)) { New-Item -Path $tsPolicy -Force | Out-Null }
+          New-ItemProperty -Path $tsPolicy -Name 'fEnableWebAuthnRedirection' -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Verify
+          $val = (Get-ItemProperty -Path $tsPolicy -Name 'fEnableWebAuthnRedirection').fEnableWebAuthnRedirection
+          Write-Host "fEnableWebAuthnRedirection = $val (1 = enabled)"
+
+
       - name: Add Japanese input (Microsoft IME)
         shell: powershell
         run: |
