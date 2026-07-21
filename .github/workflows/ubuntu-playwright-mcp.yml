@@ -67,17 +67,17 @@ jobs:
           # 1) Standing virtual display + desktop, independent of any RDP client.
           #    The session lives here (not created on connect), so reconnecting
           #    with an RDP client always returns to the SAME session.
-          nohup Xvfb :0 -screen 0 1600x900x24 > /tmp/xvfb.log 2>&1 &
+          setsid Xvfb :0 -screen 0 1600x900x24 < /dev/null > /tmp/xvfb.log 2>&1 &
           sleep 3
-          nohup startxfce4 > /tmp/xfce.log 2>&1 &
+          setsid startxfce4 < /dev/null > /tmp/xfce.log 2>&1 &
           sleep 3
           # 2) x11vnc serves the standing :0 display on localhost (xrdp backend).
           mkdir -p /home/runner/.vnc
           PW="${VNC_PASSWORD:-}"
           if [ -z "$PW" ]; then PW="changeme"; echo "WARNING: VNC_PASSWORD not set; using default 'changeme'"; fi
           x11vnc -storepasswd "$PW" /home/runner/.vnc/passwd
-          nohup x11vnc -display :0 -rfbauth /home/runner/.vnc/passwd -forever -shared \
-            -localhost -rfbport "$VNC_PORT" -bg -o /tmp/x11vnc.log > /tmp/x11vnc.out 2>&1 || true
+          setsid x11vnc -display :0 -rfbauth /home/runner/.vnc/passwd -forever -shared \
+            -localhost -rfbport "$VNC_PORT" -bg -o /tmp/x11vnc.log < /dev/null > /tmp/x11vnc.out 2>&1 || true
           sleep 2
           # 3) Point xrdp at the standing x11vnc session (libvnc backend => persistent).
           printf '%s\n' \
@@ -106,8 +106,8 @@ jobs:
 
       - name: Start tailscaled (userspace networking)
         run: |
-          sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
-            --statedir=/var/lib/tailscale > /tmp/tailscaled.log 2>&1 &
+          sudo setsid tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+            --statedir=/var/lib/tailscale < /dev/null > /tmp/tailscaled.log 2>&1 &
           sleep 5
           echo "tailscaled started"
 
@@ -141,8 +141,8 @@ jobs:
         run: |
           PORT="${MCP_PORT:-8931}"
           echo "$PORT" > /tmp/mcp_port
-          nohup npx @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --headless \
-            > /tmp/mcp.log 2>&1 &
+          setsid npx @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --headless \
+            < /dev/null > /tmp/mcp.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -s -o /dev/null "http://127.0.0.1:$PORT/mcp"; then
               echo "Playwright MCP is up on 127.0.0.1:$PORT"; break
@@ -154,10 +154,10 @@ jobs:
       - name: Start SSH MCP server (stdio -> HTTP/SSE via mcp-proxy)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          nohup mcp-proxy --host 127.0.0.1 --port "$SSH_MCP_PORT" -- \
+          setsid mcp-proxy --host 127.0.0.1 --port "$SSH_MCP_PORT" -- \
             npx -y ssh-mcp -- --host=127.0.0.1 --port=22 --user=runner \
             --key=/home/runner/.ssh/mcp_key --maxChars=none \
-            > /tmp/ssh-mcp.log 2>&1 &
+            < /dev/null > /tmp/ssh-mcp.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -s -o /dev/null "http://127.0.0.1:$SSH_MCP_PORT/sse"; then
               echo "SSH MCP is up on 127.0.0.1:$SSH_MCP_PORT"; break
