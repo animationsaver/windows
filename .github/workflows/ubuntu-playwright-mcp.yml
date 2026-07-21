@@ -1,4 +1,4 @@
-name: Ubuntu Playwright MCP + SSH MCP + VNC via Tailscale Funnel
+name: Ubuntu Playwright MCP + SSH MCP + RDP via Tailscale
 
 on:
   workflow_dispatch:
@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 360
     env:
       SSH_MCP_PORT: "8932"
-      NOVNC_PORT: "6080"
       VNC_PORT: "5900"
+      RDP_PORT: "3389"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,17 +31,17 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install packages (browsers, desktop, VNC, proxy)
+      - name: Install packages (browsers, desktop, xrdp, proxy)
         run: |
           npm install -g @playwright/mcp@latest
           npx playwright install --with-deps chromium
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             openssh-server xfce4 xfce4-goodies dbus-x11 \
-            xvfb x11vnc novnc websockify pipx chromium-browser || \
+            xvfb x11vnc xrdp pipx chromium-browser || \
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             openssh-server xfce4 xfce4-goodies dbus-x11 \
-            xvfb x11vnc novnc websockify pipx
+            xvfb x11vnc xrdp pipx
           pipx install mcp-proxy || pip install --user mcp-proxy
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "Packages installed"
@@ -50,7 +50,6 @@ jobs:
         run: |
           sudo mkdir -p /run/sshd
           mkdir -p /home/runner/.ssh
-          # Ephemeral key pair used only by the local SSH MCP -> localhost
           ssh-keygen -t ed25519 -N "" -f /home/runner/.ssh/mcp_key <<< y
           cat /home/runner/.ssh/mcp_key.pub >> /home/runner/.ssh/authorized_keys
           chmod 700 /home/runner/.ssh
@@ -59,31 +58,46 @@ jobs:
           sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
           echo "SSH server ready on 127.0.0.1:22"
 
-      - name: Start virtual desktop + VNC (Xvfb + XFCE + x11vnc + noVNC)
+      - name: Start PERSISTENT desktop (Xvfb + XFCE) and attach xrdp via x11vnc
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           export DISPLAY=:0
           echo "DISPLAY=:0" >> "$GITHUB_ENV"
-          # Virtual framebuffer (GitHub runners have no real display)
-          nohup Xvfb :0 -screen 0 1360x768x24 > /tmp/xvfb.log 2>&1 &
+          # 1) Standing virtual display + desktop, independent of any RDP client.
+          #    The session lives here (not created on connect), so reconnecting
+          #    with an RDP client always returns to the SAME session.
+          nohup Xvfb :0 -screen 0 1600x900x24 > /tmp/xvfb.log 2>&1 &
           sleep 3
           nohup startxfce4 > /tmp/xfce.log 2>&1 &
           sleep 3
+          # 2) x11vnc serves the standing :0 display on localhost (xrdp backend).
           mkdir -p /home/runner/.vnc
           PW="${VNC_PASSWORD:-}"
           if [ -z "$PW" ]; then PW="changeme"; echo "WARNING: VNC_PASSWORD not set; using default 'changeme'"; fi
           x11vnc -storepasswd "$PW" /home/runner/.vnc/passwd
           nohup x11vnc -display :0 -rfbauth /home/runner/.vnc/passwd -forever -shared \
-            -rfbport "$VNC_PORT" -bg -o /tmp/x11vnc.log > /tmp/x11vnc.out 2>&1 || true
-          # noVNC web client (browser access) proxying to the VNC port
-          if [ -d /usr/share/novnc ]; then
-            ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html 2>/dev/null || true
-            nohup websockify --web=/usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" \
-              > /tmp/novnc.log 2>&1 &
-          fi
-          sleep 3
-          echo "noVNC on http://127.0.0.1:$NOVNC_PORT/vnc.html"
+            -localhost -rfbport "$VNC_PORT" -bg -o /tmp/x11vnc.log > /tmp/x11vnc.out 2>&1 || true
+          sleep 2
+          # 3) Point xrdp at the standing x11vnc session (libvnc backend => persistent).
+          printf '%s\n' \
+            '[Globals]' \
+            'port=3389' \
+            'crypt_level=high' \
+            'channel_code=1' \
+            'max_bpp=24' \
+            'bitmap_cache=yes' \
+            'bitmap_compression=yes' \
+            '[Standing]' \
+            'name=Standing Desktop (persistent)' \
+            'lib=libvnc.so' \
+            'ip=127.0.0.1' \
+            'port=5900' \
+            'username=na' \
+            'password=ask' | sudo tee /etc/xrdp/xrdp.ini > /dev/null
+          sudo systemctl restart xrdp 2>/dev/null || sudo service xrdp restart 2>/dev/null || { sudo xrdp-sesman || true; sudo xrdp || true; }
+          sleep 2
+          echo "xrdp listening on :$RDP_PORT -> persistent :0 desktop"
 
       - name: Install Tailscale
         run: |
@@ -116,8 +130,6 @@ jobs:
 
       - name: Connect Tailscale (with Tailscale SSH enabled)
         run: |
-          # --ssh enables Tailscale SSH so you can 'ssh runner@<host>.<tailnet>.ts.net'
-          # directly from any device in your tailnet (requires an ACL ssh rule).
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
             --hostname="gha-ubuntu-mcp" --ssh --accept-routes
           sleep 3
@@ -154,22 +166,23 @@ jobs:
           done
           cat /tmp/ssh-mcp.log || true
 
-      - name: Expose everything via Tailscale Funnel
+      - name: Expose MCP servers via Tailscale Funnel
         run: |
           PORT="$(cat /tmp/mcp_port)"
-          # Funnel supports only ports 443, 8443 and 10000.
-          sudo tailscale funnel --bg --https=443   "http://127.0.0.1:$PORT"
-          sudo tailscale funnel --bg --https=8443  "http://127.0.0.1:$SSH_MCP_PORT"
-          sudo tailscale funnel --bg --https=10000 "http://127.0.0.1:$NOVNC_PORT"
+          sudo tailscale funnel --bg --https=443  "http://127.0.0.1:$PORT"
+          sudo tailscale funnel --bg --https=8443 "http://127.0.0.1:$SSH_MCP_PORT"
           sleep 3
           sudo tailscale funnel status || true
           HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          IP=$(tailscale ip -4 | head -n1)
           echo "=================================================="
           echo "  Playwright MCP : https://$HOST/mcp"
           echo "  SSH MCP (SSE)  : https://$HOST:8443/sse"
           echo "  SSH MCP (HTTP) : https://$HOST:8443/mcp"
-          echo "  noVNC (browser): https://$HOST:10000/vnc.html"
-          echo "  Your own SSH   : ssh runner@$HOST   (via Tailscale SSH)"
+          echo ""
+          echo "  RDP (Tailscale, NOT Funnel): $IP:3389  or  $HOST:3389"
+          echo "    -> pick 'Standing Desktop', password = VNC_PASSWORD"
+          echo "  Your own SSH  : ssh runner@$HOST   (Tailscale SSH)"
           echo "=================================================="
 
       - name: Keep session alive
@@ -192,9 +205,8 @@ jobs:
         env:
           TS_API_KEY: ${{ secrets.TS_API_KEY }}
         run: |
-          sudo tailscale funnel --https=443 off   || echo "443 off skipped"
-          sudo tailscale funnel --https=8443 off  || echo "8443 off skipped"
-          sudo tailscale funnel --https=10000 off || echo "10000 off skipped"
+          sudo tailscale funnel --https=443 off  || echo "443 off skipped"
+          sudo tailscale funnel --https=8443 off || echo "8443 off skipped"
           sudo tailscale logout || echo "logout skipped"
           if [ -n "$TS_API_KEY" ]; then
             ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
