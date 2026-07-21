@@ -1,4 +1,4 @@
-name: Ubuntu Playwright MCP + SSH via Tailscale Funnel
+name: Ubuntu Playwright MCP + SSH MCP + VNC via Tailscale Funnel
 
 on:
   workflow_dispatch:
@@ -18,6 +18,10 @@ jobs:
   playwright-mcp:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      SSH_MCP_PORT: "8932"
+      NOVNC_PORT: "6080"
+      VNC_PORT: "5900"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,36 +31,59 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install Playwright MCP + Chromium
+      - name: Install packages (browsers, desktop, VNC, proxy)
         run: |
           npm install -g @playwright/mcp@latest
-          # Install Chromium and its OS dependencies for headless runs
           npx playwright install --with-deps chromium
-          echo "Playwright MCP installed"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openssh-server xfce4 xfce4-goodies dbus-x11 \
+            xvfb x11vnc novnc websockify pipx chromium-browser || \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openssh-server xfce4 xfce4-goodies dbus-x11 \
+            xvfb x11vnc novnc websockify pipx
+          pipx install mcp-proxy || pip install --user mcp-proxy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "Packages installed"
 
-      - name: Enable SSH server
-        env:
-          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+      - name: Enable SSH server + local key for SSH MCP
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y openssh-server
           sudo mkdir -p /run/sshd
-          if [ -n "$SSH_PUBLIC_KEY" ]; then
-            mkdir -p /home/runner/.ssh
-            echo "$SSH_PUBLIC_KEY" >> /home/runner/.ssh/authorized_keys
-            chmod 700 /home/runner/.ssh
-            chmod 600 /home/runner/.ssh/authorized_keys
-            echo "Installed SSH public key for user 'runner'"
-          fi
-          if [ -n "$SSH_PASSWORD" ]; then
-            echo "runner:$SSH_PASSWORD" | sudo chpasswd
-            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-            echo "Enabled password auth for user 'runner'"
-          fi
+          mkdir -p /home/runner/.ssh
+          # Ephemeral key pair used only by the local SSH MCP -> localhost
+          ssh-keygen -t ed25519 -N "" -f /home/runner/.ssh/mcp_key <<< y
+          cat /home/runner/.ssh/mcp_key.pub >> /home/runner/.ssh/authorized_keys
+          chmod 700 /home/runner/.ssh
+          chmod 600 /home/runner/.ssh/authorized_keys /home/runner/.ssh/mcp_key
           sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
-          echo "SSH server ready on port 22"
+          echo "SSH server ready on 127.0.0.1:22"
+
+      - name: Start virtual desktop + VNC (Xvfb + XFCE + x11vnc + noVNC)
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          export DISPLAY=:0
+          echo "DISPLAY=:0" >> "$GITHUB_ENV"
+          # Virtual framebuffer (GitHub runners have no real display)
+          nohup Xvfb :0 -screen 0 1360x768x24 > /tmp/xvfb.log 2>&1 &
+          sleep 3
+          nohup startxfce4 > /tmp/xfce.log 2>&1 &
+          sleep 3
+          mkdir -p /home/runner/.vnc
+          PW="${VNC_PASSWORD:-}"
+          if [ -z "$PW" ]; then PW="changeme"; echo "WARNING: VNC_PASSWORD not set; using default 'changeme'"; fi
+          x11vnc -storepasswd "$PW" /home/runner/.vnc/passwd
+          nohup x11vnc -display :0 -rfbauth /home/runner/.vnc/passwd -forever -shared \
+            -rfbport "$VNC_PORT" -bg -o /tmp/x11vnc.log > /tmp/x11vnc.out 2>&1 || true
+          # noVNC web client (browser access) proxying to the VNC port
+          if [ -d /usr/share/novnc ]; then
+            ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html 2>/dev/null || true
+            nohup websockify --web=/usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" \
+              > /tmp/novnc.log 2>&1 &
+          fi
+          sleep 3
+          echo "noVNC on http://127.0.0.1:$NOVNC_PORT/vnc.html"
 
       - name: Install Tailscale
         run: |
@@ -87,8 +114,10 @@ jobs:
             done
           fi
 
-      - name: Connect Tailscale
+      - name: Connect Tailscale (with Tailscale SSH enabled)
         run: |
+          # --ssh enables Tailscale SSH so you can 'ssh runner@<host>.<tailnet>.ts.net'
+          # directly from any device in your tailnet (requires an ACL ssh rule).
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
             --hostname="gha-ubuntu-mcp" --ssh --accept-routes
           sleep 3
@@ -104,30 +133,43 @@ jobs:
             > /tmp/mcp.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -s -o /dev/null "http://127.0.0.1:$PORT/mcp"; then
-              echo "Playwright MCP is up on 127.0.0.1:$PORT"
-              break
+              echo "Playwright MCP is up on 127.0.0.1:$PORT"; break
             fi
             sleep 2
           done
-          echo "----- mcp.log -----"
           cat /tmp/mcp.log || true
 
-      - name: Expose Playwright MCP + SSH via Tailscale Funnel
+      - name: Start SSH MCP server (stdio -> HTTP/SSE via mcp-proxy)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          nohup mcp-proxy --host 127.0.0.1 --port "$SSH_MCP_PORT" -- \
+            npx -y ssh-mcp -- --host=127.0.0.1 --port=22 --user=runner \
+            --key=/home/runner/.ssh/mcp_key --maxChars=none \
+            > /tmp/ssh-mcp.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null "http://127.0.0.1:$SSH_MCP_PORT/sse"; then
+              echo "SSH MCP is up on 127.0.0.1:$SSH_MCP_PORT"; break
+            fi
+            sleep 2
+          done
+          cat /tmp/ssh-mcp.log || true
+
+      - name: Expose everything via Tailscale Funnel
         run: |
           PORT="$(cat /tmp/mcp_port)"
-          # Playwright MCP over public HTTPS :443
-          sudo tailscale funnel --bg --https=443 "http://127.0.0.1:$PORT"
-          # SSH over public TLS-terminated TCP :8443 (client must wrap in TLS)
-          sudo tailscale funnel --bg --tls-terminated-tcp=8443 "tcp://127.0.0.1:22"
+          # Funnel supports only ports 443, 8443 and 10000.
+          sudo tailscale funnel --bg --https=443   "http://127.0.0.1:$PORT"
+          sudo tailscale funnel --bg --https=8443  "http://127.0.0.1:$SSH_MCP_PORT"
+          sudo tailscale funnel --bg --https=10000 "http://127.0.0.1:$NOVNC_PORT"
           sleep 3
           sudo tailscale funnel status || true
           HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "=================================================="
-          echo "  Playwright MCP (SSE/HTTP) public endpoint:"
-          echo "    https://$HOST/mcp"
-          echo ""
-          echo "  SSH (TLS-terminated TCP on :8443):"
-          echo "    ssh -o ProxyCommand='openssl s_client -quiet -connect $HOST:8443' runner@$HOST"
+          echo "  Playwright MCP : https://$HOST/mcp"
+          echo "  SSH MCP (SSE)  : https://$HOST:8443/sse"
+          echo "  SSH MCP (HTTP) : https://$HOST:8443/mcp"
+          echo "  noVNC (browser): https://$HOST:10000/vnc.html"
+          echo "  Your own SSH   : ssh runner@$HOST   (via Tailscale SSH)"
           echo "=================================================="
 
       - name: Keep session alive
@@ -141,15 +183,7 @@ jobs:
           echo "Create /tmp/stop.txt on the runner to end early"
           END=$(( $(date +%s) + MIN * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            if [ -f "/tmp/stop.txt" ]; then
-              echo "stop.txt detected. Ending."
-              break
-            fi
-            if ! pgrep -f "@playwright/mcp" >/dev/null 2>&1; then
-              echo "Playwright MCP process is no longer running:"
-              cat /tmp/mcp.log || true
-              break
-            fi
+            if [ -f "/tmp/stop.txt" ]; then echo "stop.txt detected. Ending."; break; fi
             sleep 30
           done
 
@@ -158,8 +192,9 @@ jobs:
         env:
           TS_API_KEY: ${{ secrets.TS_API_KEY }}
         run: |
-          sudo tailscale funnel --https=443 off || echo "funnel https off skipped"
-          sudo tailscale funnel --tls-terminated-tcp=8443 off || echo "funnel tcp off skipped"
+          sudo tailscale funnel --https=443 off   || echo "443 off skipped"
+          sudo tailscale funnel --https=8443 off  || echo "8443 off skipped"
+          sudo tailscale funnel --https=10000 off || echo "10000 off skipped"
           sudo tailscale logout || echo "logout skipped"
           if [ -n "$TS_API_KEY" ]; then
             ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
