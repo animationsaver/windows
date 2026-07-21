@@ -18,28 +18,50 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set login password for 'runner'
+      # A freshly created user avoids the SecureToken problem that makes
+      # resetting the built-in 'runner' password unreliable.
+      - name: Create dedicated VNC admin user 'vncuser'
+        env:
+          ACCOUNT_PW: ${{ secrets.RDP_PASSWORD }}
         run: |
-          sudo sysadminctl -resetPasswordFor runner -newPassword "${{ secrets.RDP_PASSWORD }}"
-          echo "runner password set"
+          set -e
+          PW="${ACCOUNT_PW:-changeme1234}"
+          sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin
+          sudo createhomedir -c -u vncuser >/dev/null 2>&1 || true
+          echo "Created user 'vncuser' (login name: vncuser)."
 
-      - name: Enable Screen Sharing (VNC / Remote Management)
+      # Use the built-in Screen Sharing service, NOT Remote Management (ARD).
+      # Remote Management (kickstart -activate) locks out Finder's vnc:// on
+      # macOS 12.1+, so we explicitly turn it OFF and enable plain screensharing.
+      - name: Enable built-in Screen Sharing (not Remote Management)
         env:
           VNC_LEGACY_PW: ${{ secrets.VNC_PASSWORD }}
+          FALLBACK_PW: ${{ secrets.RDP_PASSWORD }}
         run: |
+          set +e
           KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
-          # Turn on Remote Management with full access for all users and enable legacy VNC.
-          sudo "$KICK" -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -restart -agent -privs -all -allowAccessFor -allUsers
-          # Optional legacy VNC password (max 8 chars) for 3rd-party VNC clients (TightVNC etc.).
-          if [ -n "$VNC_LEGACY_PW" ]; then
-            sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_LEGACY_PW"
-            echo "Legacy VNC password configured (only first 8 chars are used)"
+
+          # Make sure Remote Management is off so it does not control Screen Sharing.
+          sudo "$KICK" -deactivate -stop 2>/dev/null
+
+          # Enable + start the built-in Screen Sharing daemon.
+          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist \
+            com.apple.screensharing -dict Disabled -bool false 2>/dev/null
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null
+
+          # Set a legacy VNC password (max 8 chars) so ANY VNC client, including
+          # Finder's Screen Sharing, can authenticate with just the password.
+          PW="${VNC_LEGACY_PW:-}"
+          if [ -z "$PW" ]; then PW="$(printf '%s' "$FALLBACK_PW" | cut -c1-8)"; fi
+          if [ -n "$PW" ]; then
+            sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" 2>/dev/null
+            echo "Legacy VNC password configured (only the first 8 chars are used)."
           fi
-          # Make sure the built-in Screen Sharing service is loaded too.
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          echo "Screen Sharing enabled"
+          # Restart screensharingd so settings take effect.
+          sudo pkill -x screensharingd 2>/dev/null
+          sleep 2
+          echo "Built-in Screen Sharing enabled."
 
       - name: Install Tailscale
         run: |
@@ -65,7 +87,6 @@ jobs:
 
       - name: Connect Tailscale
         run: |
-          # Run the daemon (creates a real utun interface so the VNC port is reachable).
           sudo tailscaled > /tmp/tailscaled.log 2>&1 &
           sleep 5
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
@@ -74,8 +95,10 @@ jobs:
           IP=$(tailscale ip -4)
           echo "=================================================="
           echo "  Tailscale IP : $IP"
-          echo "  Connect via VNC / Screen Sharing as user: runner"
-          echo "  From a Mac : open  vnc://$IP"
+          echo "  From a Mac   : Finder > Go > Connect to Server > vnc://$IP"
+          echo "  Auth         : enter the VNC password (VNC_PASSWORD, or"
+          echo "                 the first 8 chars of RDP_PASSWORD if unset)."
+          echo "  Account login (if prompted): vncuser / RDP_PASSWORD"
           echo "=================================================="
 
       - name: Provision Chrome environment (optional)
@@ -89,7 +112,6 @@ jobs:
 
       - name: Add Japanese input source (best-effort)
         run: |
-          # macOS runners ship Japanese input; register it so it shows in the switcher.
           defaults write com.apple.HIToolbox AppleEnabledInputSources -array-add \
             '{ "InputSourceKind" = "Keyboard Layout"; "KeyboardLayout ID" = 0; "KeyboardLayout Name" = "U.S."; }' \
             '{ "Bundle ID" = "com.apple.inputmethod.Kotoeri"; "Input Mode" = "com.apple.inputmethod.Japanese"; "InputSourceKind" = "Input Mode"; }' 2>/dev/null || true
@@ -103,10 +125,10 @@ jobs:
           case "$MIN" in ''|*[!0-9]*) MIN=60;; esac
           if [ "$MIN" -le 0 ]; then MIN=60; fi
           echo "Keeping session for $MIN minutes"
-          echo "Create /Users/runner/Desktop/stop.txt to end early"
+          echo "Create /Users/vncuser/Desktop/stop.txt to end early"
           END=$(( $(date +%s) + MIN * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            if [ -f "/Users/runner/Desktop/stop.txt" ]; then
+            if [ -f "/Users/vncuser/Desktop/stop.txt" ] || [ -f "/Users/runner/Desktop/stop.txt" ]; then
               echo "stop.txt detected. Ending."
               break
             fi
