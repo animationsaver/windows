@@ -13,13 +13,11 @@ on:
 jobs:
   vnc:
     runs-on: macos-latest
-    timeout-minutes: 360   # GitHub Actions hard limit (6 hours)
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # A freshly created user avoids the SecureToken problem that makes
-      # resetting the built-in 'runner' password unreliable.
       - name: Create dedicated VNC admin user 'vncuser'
         env:
           ACCOUNT_PW: ${{ secrets.RDP_PASSWORD }}
@@ -28,12 +26,15 @@ jobs:
           PW="${ACCOUNT_PW:-changeme1234}"
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin
           sudo createhomedir -c -u vncuser >/dev/null 2>&1 || true
-          echo "Created user 'vncuser' (login name: vncuser)."
+          echo "Created user 'vncuser'."
 
-      # Use the built-in Screen Sharing service, NOT Remote Management (ARD).
-      # Remote Management (kickstart -activate) locks out Finder's vnc:// on
-      # macOS 12.1+, so we explicitly turn it OFF and enable plain screensharing.
-      - name: Enable built-in Screen Sharing (not Remote Management)
+      # Proven approach (dikeckaan/MacOS-Workflow-VNC, paulz gist):
+      # enable Remote Management (ARD) with full privileges for ALL users AND
+      # legacy VNC, then write the obfuscated VNC password directly into
+      # com.apple.VNCSettings.txt. Finder's Screen Sharing then connects with
+      # just the VNC password. Do NOT deactivate RM / hand-load screensharingd
+      # (that causes the "Screen Sharing is not permitted" conflict).
+      - name: Enable Remote Management + legacy VNC password
         env:
           VNC_LEGACY_PW: ${{ secrets.VNC_PASSWORD }}
           FALLBACK_PW: ${{ secrets.RDP_PASSWORD }}
@@ -41,27 +42,22 @@ jobs:
           set +e
           KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
-          # Make sure Remote Management is off so it does not control Screen Sharing.
-          sudo "$KICK" -deactivate -stop 2>/dev/null
-
-          # Enable + start the built-in Screen Sharing daemon.
-          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist \
-            com.apple.screensharing -dict Disabled -bool false 2>/dev/null
-          sudo launchctl enable system/com.apple.screensharing 2>/dev/null
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null
-
-          # Set a legacy VNC password (max 8 chars) so ANY VNC client, including
-          # Finder's Screen Sharing, can authenticate with just the password.
           PW="${VNC_LEGACY_PW:-}"
           if [ -z "$PW" ]; then PW="$(printf '%s' "$FALLBACK_PW" | cut -c1-8)"; fi
-          if [ -n "$PW" ]; then
-            sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" 2>/dev/null
-            echo "Legacy VNC password configured (only the first 8 chars are used)."
-          fi
-          # Restart screensharingd so settings take effect.
-          sudo pkill -x screensharingd 2>/dev/null
-          sleep 2
-          echo "Built-in Screen Sharing enabled."
+
+          # Grant full-control access to all users and turn on legacy VNC.
+          sudo "$KICK" -configure -allowAccessFor -allUsers -privs -all
+          sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes
+
+          # Write the (max 8-char) VNC password in the obfuscated format ARD expects.
+          HASH=$(python3 -c 'import sys; k=bytes.fromhex("1734516E8BA8C5E2FF1C39567390ADCA"); p=sys.argv[1][:8].encode(); print("".join("%02X"%(k[i]^(p[i] if i<len(p) else 0)) for i in range(len(k))))' "$PW")
+          echo "$HASH" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+
+          # Restart the ARD agent and activate Remote Management.
+          sudo "$KICK" -restart -agent -console
+          sudo "$KICK" -activate
+          echo "Remote Management + legacy VNC enabled."
+          echo "Connect from Finder with the VNC password (no account needed)."
 
       - name: Install Tailscale
         run: |
@@ -96,9 +92,8 @@ jobs:
           echo "=================================================="
           echo "  Tailscale IP : $IP"
           echo "  From a Mac   : Finder > Go > Connect to Server > vnc://$IP"
-          echo "  Auth         : enter the VNC password (VNC_PASSWORD, or"
-          echo "                 the first 8 chars of RDP_PASSWORD if unset)."
-          echo "  Account login (if prompted): vncuser / RDP_PASSWORD"
+          echo "  Password     : the VNC password (VNC_PASSWORD, or the first"
+          echo "                 8 chars of RDP_PASSWORD if VNC_PASSWORD is unset)."
           echo "=================================================="
 
       - name: Provision Chrome environment (optional)
@@ -115,7 +110,7 @@ jobs:
           defaults write com.apple.HIToolbox AppleEnabledInputSources -array-add \
             '{ "InputSourceKind" = "Keyboard Layout"; "KeyboardLayout ID" = 0; "KeyboardLayout Name" = "U.S."; }' \
             '{ "Bundle ID" = "com.apple.inputmethod.Kotoeri"; "Input Mode" = "com.apple.inputmethod.Japanese"; "InputSourceKind" = "Input Mode"; }' 2>/dev/null || true
-          echo "Japanese (Kotoeri) input requested. Switch with Ctrl+Space / the menu bar."
+          echo "Japanese (Kotoeri) input requested."
 
       - name: Keep session alive
         env:
@@ -125,10 +120,10 @@ jobs:
           case "$MIN" in ''|*[!0-9]*) MIN=60;; esac
           if [ "$MIN" -le 0 ]; then MIN=60; fi
           echo "Keeping session for $MIN minutes"
-          echo "Create /Users/vncuser/Desktop/stop.txt to end early"
+          echo "Create /Users/runner/Desktop/stop.txt to end early"
           END=$(( $(date +%s) + MIN * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            if [ -f "/Users/vncuser/Desktop/stop.txt" ] || [ -f "/Users/runner/Desktop/stop.txt" ]; then
+            if [ -f "/Users/runner/Desktop/stop.txt" ] || [ -f "/Users/vncuser/Desktop/stop.txt" ]; then
               echo "stop.txt detected. Ending."
               break
             fi
