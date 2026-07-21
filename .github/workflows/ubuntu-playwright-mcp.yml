@@ -144,7 +144,7 @@ jobs:
           setsid npx @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --headless \
             < /dev/null > /tmp/mcp.log 2>&1 &
           for i in $(seq 1 30); do
-            if curl -s -o /dev/null "http://127.0.0.1:$PORT/mcp"; then
+            if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/mcp"; then
               echo "Playwright MCP is up on 127.0.0.1:$PORT"; break
             fi
             sleep 2
@@ -158,12 +158,16 @@ jobs:
             npx -y ssh-mcp -- --host=127.0.0.1 --port=22 --user=runner \
             --key=/home/runner/.ssh/mcp_key --maxChars=none \
             < /dev/null > /tmp/ssh-mcp.log 2>&1 &
+          # NOTE: /sse is a long-lived SSE stream, so curling it blocks forever
+          # and hangs this step. Probe the TCP port being open instead.
           for i in $(seq 1 30); do
-            if curl -s -o /dev/null "http://127.0.0.1:$SSH_MCP_PORT/sse"; then
-              echo "SSH MCP is up on 127.0.0.1:$SSH_MCP_PORT"; break
+            if (exec 3<>/dev/tcp/127.0.0.1/"$SSH_MCP_PORT") 2>/dev/null; then
+              exec 3>&- 3<&-
+              echo "SSH MCP port $SSH_MCP_PORT is open"; break
             fi
             sleep 2
           done
+          sleep 2
           cat /tmp/ssh-mcp.log || true
 
       - name: Expose MCP servers via Tailscale Funnel
