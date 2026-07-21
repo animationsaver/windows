@@ -141,7 +141,16 @@ jobs:
         run: |
           PORT="${MCP_PORT:-8931}"
           echo "$PORT" > /tmp/mcp_port
+          # Playwright MCP has DNS-rebinding protection and returns 403
+          # ("Access is only allowed at localhost:PORT") for any Host header
+          # other than its bound host. Behind Tailscale Funnel the incoming
+          # Host header is the public MagicDNS name, so it must be allowed
+          # explicitly or no external client (incl. Notion) can connect.
+          TSHOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "Allowing Host: $TSHOST"
           setsid npx @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --headless \
+            --allowed-hosts "$TSHOST" \
+            --allowed-origins "https://$TSHOST" \
             < /dev/null > /tmp/mcp.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/mcp"; then
