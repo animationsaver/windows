@@ -1,0 +1,131 @@
+name: macOS Screen Sharing via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Minutes to keep the session alive (max ~350 / 6h limit)"
+        required: false
+        default: "350"
+  repository_dispatch:
+    types: [start-vnc]
+
+jobs:
+  vnc:
+    runs-on: macos-latest
+    timeout-minutes: 360   # GitHub Actions hard limit (6 hours)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set login password for 'runner'
+        run: |
+          sudo sysadminctl -resetPasswordFor runner -newPassword "${{ secrets.RDP_PASSWORD }}"
+          echo "runner password set"
+
+      - name: Enable Screen Sharing (VNC / Remote Management)
+        env:
+          VNC_LEGACY_PW: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          # Turn on Remote Management with full access for all users and enable legacy VNC.
+          sudo "$KICK" -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -restart -agent -privs -all -allowAccessFor -allUsers
+          # Optional legacy VNC password (max 8 chars) for 3rd-party VNC clients (TightVNC etc.).
+          if [ -n "$VNC_LEGACY_PW" ]; then
+            sudo "$KICK" -configure -clientopts -setvncpw -vncpw "$VNC_LEGACY_PW"
+            echo "Legacy VNC password configured (only first 8 chars are used)"
+          fi
+          # Make sure the built-in Screen Sharing service is loaded too.
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          echo "Screen Sharing enabled"
+
+      - name: Install Tailscale
+        run: |
+          brew install tailscale
+          echo "Tailscale installed"
+
+      - name: Remove stale Tailscale device
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          if [ -z "$TS_API_KEY" ]; then
+            echo "TS_API_KEY not set; skipping stale-device cleanup"
+          else
+            ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-macos-vnc")) or (.name // "" | startswith("gha-macos-vnc"))) | .id')
+            for id in $ids; do
+              curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" \
+                "https://api.tailscale.com/api/v2/device/$id" >/dev/null
+              echo "Deleted stale device: $id"
+            done
+          fi
+
+      - name: Connect Tailscale
+        run: |
+          # Run the daemon (creates a real utun interface so the VNC port is reachable).
+          sudo tailscaled > /tmp/tailscaled.log 2>&1 &
+          sleep 5
+          sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
+            --hostname="gha-macos-vnc" --accept-routes
+          sleep 3
+          IP=$(tailscale ip -4)
+          echo "=================================================="
+          echo "  Tailscale IP : $IP"
+          echo "  Connect via VNC / Screen Sharing as user: runner"
+          echo "  From a Mac : open  vnc://$IP"
+          echo "=================================================="
+
+      - name: Provision Chrome environment (optional)
+        run: |
+          if [ -f setup.sh ]; then
+            chmod +x setup.sh
+            ./setup.sh || echo "setup.sh failed (non-fatal)"
+          else
+            echo "setup.sh not found; skipping"
+          fi
+
+      - name: Add Japanese input source (best-effort)
+        run: |
+          # macOS runners ship Japanese input; register it so it shows in the switcher.
+          defaults write com.apple.HIToolbox AppleEnabledInputSources -array-add \
+            '{ "InputSourceKind" = "Keyboard Layout"; "KeyboardLayout ID" = 0; "KeyboardLayout Name" = "U.S."; }' \
+            '{ "Bundle ID" = "com.apple.inputmethod.Kotoeri"; "Input Mode" = "com.apple.inputmethod.Japanese"; "InputSourceKind" = "Input Mode"; }' 2>/dev/null || true
+          echo "Japanese (Kotoeri) input requested. Switch with Ctrl+Space / the menu bar."
+
+      - name: Keep session alive
+        env:
+          SESSION_MINUTES: "${{ github.event.inputs.session_minutes || github.event.client_payload.minutes || '350' }}"
+        run: |
+          MIN="${SESSION_MINUTES:-350}"
+          case "$MIN" in ''|*[!0-9]*) MIN=60;; esac
+          if [ "$MIN" -le 0 ]; then MIN=60; fi
+          echo "Keeping session for $MIN minutes"
+          echo "Create /Users/runner/Desktop/stop.txt to end early"
+          END=$(( $(date +%s) + MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if [ -f "/Users/runner/Desktop/stop.txt" ]; then
+              echo "stop.txt detected. Ending."
+              break
+            fi
+            sleep 30
+          done
+
+      - name: Tailscale logout and remove device
+        if: always()
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          sudo tailscale logout || echo "logout skipped"
+          if [ -n "$TS_API_KEY" ]; then
+            ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-macos-vnc")) or (.name // "" | startswith("gha-macos-vnc"))) | .id')
+            for id in $ids; do
+              curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" \
+                "https://api.tailscale.com/api/v2/device/$id" >/dev/null
+              echo "Removed device from tailnet: $id"
+            done
+          fi
