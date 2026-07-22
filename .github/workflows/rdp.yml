@@ -1,6 +1,8 @@
 name: Windows RDP via Tailscale
 
 on:
+  schedule:
+    - cron: "7 */6 * * *"
   workflow_dispatch:
     inputs:
       session_minutes:
@@ -86,7 +88,6 @@ jobs:
           # Verify
           $val = (Get-ItemProperty -Path $tsPolicy -Name 'fEnableWebAuthnRedirection').fEnableWebAuthnRedirection
           Write-Host "fEnableWebAuthnRedirection = $val (1 = enabled)"
-
 
       - name: Add Japanese input (Microsoft IME)
         shell: powershell
