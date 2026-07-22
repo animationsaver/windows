@@ -1,6 +1,8 @@
 name: Ubuntu Playwright MCP + SSH MCP + RDP via Tailscale
 
 on:
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       session_minutes:
