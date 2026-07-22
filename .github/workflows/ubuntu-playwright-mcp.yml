@@ -145,12 +145,18 @@ jobs:
           # ("Access is only allowed at localhost:PORT") for any Host header
           # other than its bound host. Behind Tailscale Funnel the incoming
           # Host header is the public MagicDNS name, so it must be allowed
-          # explicitly or no external client (incl. Notion) can connect.
+          # explicitly via --allowed-hosts or no external client (incl. Notion)
+          # can connect.
+          #
+          # IMPORTANT: do NOT add --allowed-origins here. That flag is a
+          # BROWSER navigation allowlist (network security boundary), not the
+          # server Host check. Setting it restricts the automated browser to
+          # only that origin and blocks navigation to every other site with
+          # net::ERR_BLOCKED_BY_CLIENT.
           TSHOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "Allowing Host: $TSHOST"
           setsid npx @playwright/mcp@latest --port "$PORT" --host 127.0.0.1 --headless \
             --allowed-hosts "$TSHOST" \
-            --allowed-origins "https://$TSHOST" \
             < /dev/null > /tmp/mcp.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/mcp"; then
