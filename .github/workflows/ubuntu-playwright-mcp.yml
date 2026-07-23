@@ -60,6 +60,30 @@ jobs:
           sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
           echo "SSH server ready on 127.0.0.1:22"
 
+      - name: Configure git to authenticate to GitHub via PAT (for SSH sessions)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "GH_PAT secret not set; skipping git credential setup"
+          else
+            # credential.helper store reads ~/.git-credentials for every
+            # https://github.com git operation, so any SSH session as 'runner'
+            # can push/pull without re-entering credentials.
+            git config --global credential.helper store
+            git config --global user.name "${{ github.actor }}"
+            git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+            printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
+            chmod 600 "$HOME/.git-credentials"
+            # Route any SSH-style remote (git@github.com:/ssh://) through
+            # authenticated HTTPS so existing clones also work with the PAT.
+            git config --global url."https://github.com/".insteadOf "git@github.com:"
+            git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+            # Make the same config visible to the checked-out repo's origin.
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
+            echo "git configured for GitHub auth (user: ${{ github.actor }})"
+          fi
+
       - name: Start PERSISTENT desktop (Xvfb + XFCE) and attach xrdp via x11vnc
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
