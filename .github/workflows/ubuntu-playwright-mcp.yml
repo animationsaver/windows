@@ -122,7 +122,7 @@ jobs:
           else
             ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
               "https://api.tailscale.com/api/v2/tailnet/-/devices" \
-              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-ubuntu-mcp")) or (.name // "" | startswith("gha-ubuntu-mcp"))) | .id')
+              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-ubuntu-rdp")) or (.name // "" | startswith("gha-ubuntu-rdp"))) | .id')
             for id in $ids; do
               curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" \
                 "https://api.tailscale.com/api/v2/device/$id" >/dev/null
@@ -133,9 +133,31 @@ jobs:
       - name: Connect Tailscale (with Tailscale SSH enabled)
         run: |
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
-            --hostname="gha-ubuntu-mcp" --ssh --accept-routes
+            --hostname="gha-ubuntu-rdp" --ssh --accept-routes
           sleep 3
           tailscale ip -4 || true
+
+      - name: Restore cached Tailscale TLS certificate
+        id: cert-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ts-cert-cache
+          key: ts-cert-gha-ubuntu-rdp-${{ github.run_id }}
+          restore-keys: |
+            ts-cert-gha-ubuntu-rdp-
+
+      - name: Seed tailscaled with cached certificate (avoids Let's Encrypt rate limit)
+        run: |
+          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          sudo mkdir -p /var/lib/tailscale/certs
+          if [ -f "ts-cert-cache/$HOST.crt" ] && [ -f "ts-cert-cache/$HOST.key" ]; then
+            sudo cp "ts-cert-cache/$HOST.crt" "/var/lib/tailscale/certs/$HOST.crt"
+            sudo cp "ts-cert-cache/$HOST.key" "/var/lib/tailscale/certs/$HOST.key"
+            sudo chmod 600 "/var/lib/tailscale/certs/$HOST.key"
+            echo "Restored cached TLS certificate for $HOST"
+          else
+            echo "No cached certificate for $HOST (first run for this hostname); a fresh one will be issued."
+          fi
 
       - name: Start Playwright MCP server
         env:
@@ -206,6 +228,33 @@ jobs:
           echo "  Your own SSH  : ssh runner@$HOST   (Tailscale SSH)"
           echo "=================================================="
 
+      - name: Persist Tailscale TLS certificate to cache
+        run: |
+          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          mkdir -p ts-cert-cache
+          # Materialize / renew the cert. Uses the existing cert if still valid;
+          # only calls Let's Encrypt when the cert is missing or near expiry.
+          # timeout so a rate-limited ACME request can never hang the job.
+          sudo timeout 120 tailscale cert \
+            --cert-file "/tmp/$HOST.crt" --key-file "/tmp/$HOST.key" "$HOST" \
+            || echo "tailscale cert non-zero (keeping existing cert store if present)"
+          if [ -f "/tmp/$HOST.crt" ] && [ -f "/tmp/$HOST.key" ]; then
+            sudo cp "/tmp/$HOST.crt" "ts-cert-cache/$HOST.crt"
+            sudo cp "/tmp/$HOST.key" "ts-cert-cache/$HOST.key"
+          elif [ -f "/var/lib/tailscale/certs/$HOST.crt" ]; then
+            sudo cp "/var/lib/tailscale/certs/$HOST.crt" "ts-cert-cache/$HOST.crt"
+            sudo cp "/var/lib/tailscale/certs/$HOST.key" "ts-cert-cache/$HOST.key"
+          fi
+          sudo chown -R "$(id -u):$(id -g)" ts-cert-cache || true
+          ls -la ts-cert-cache || true
+
+      - name: Save Tailscale TLS certificate cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ts-cert-cache
+          key: ts-cert-gha-ubuntu-rdp-${{ github.run_id }}
+
       - name: Keep session alive
         env:
           SESSION_MINUTES: "${{ github.event.inputs.session_minutes || github.event.client_payload.minutes || '350' }}"
@@ -232,7 +281,7 @@ jobs:
           if [ -n "$TS_API_KEY" ]; then
             ids=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
               "https://api.tailscale.com/api/v2/tailnet/-/devices" \
-              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-ubuntu-mcp")) or (.name // "" | startswith("gha-ubuntu-mcp"))) | .id')
+              | jq -r '.devices[] | select((.hostname // "" | startswith("gha-ubuntu-rdp")) or (.name // "" | startswith("gha-ubuntu-rdp"))) | .id')
             for id in $ids; do
               curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" \
                 "https://api.tailscale.com/api/v2/device/$id" >/dev/null
