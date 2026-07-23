@@ -63,6 +63,7 @@ jobs:
       - name: Configure git to authenticate to GitHub via PAT (for SSH sessions)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          GH_ACTOR: ${{ github.actor }}
         run: |
           if [ -z "$GH_PAT" ]; then
             echo "GH_PAT secret not set; skipping git credential setup"
@@ -71,17 +72,20 @@ jobs:
             # https://github.com git operation, so any SSH session as 'runner'
             # can push/pull without re-entering credentials.
             git config --global credential.helper store
-            git config --global user.name "${{ github.actor }}"
-            git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+            git config --global user.name "$GH_ACTOR"
+            git config --global user.email "${GH_ACTOR}@users.noreply.github.com"
             printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
             chmod 600 "$HOME/.git-credentials"
             # Route any SSH-style remote (git@github.com:/ssh://) through
             # authenticated HTTPS so existing clones also work with the PAT.
             git config --global url."https://github.com/".insteadOf "git@github.com:"
             git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-            # Make the same config visible to the checked-out repo's origin.
-            git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
-            echo "git configured for GitHub auth (user: ${{ github.actor }})"
+            # actions/checkout injects a short-lived GITHUB_TOKEN via
+            # http.extraheader on the workspace repo; drop it so SSH sessions
+            # fall back to the PAT credential helper instead of an expired token.
+            git -C "$GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git" 2>/dev/null || true
+            echo "git configured for GitHub auth (user: $GH_ACTOR)"
           fi
 
       - name: Start PERSISTENT desktop (Xvfb + XFCE) and attach xrdp via x11vnc
