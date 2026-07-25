@@ -1,0 +1,269 @@
+name: Ephemeral MCP Env (broker-managed)
+
+# Disposable, per-conversation environment.
+#
+# Differences from ubuntu-playwright-mcp.yml (which is left untouched):
+#   * Started on demand by the broker, never by cron.
+#   * Published with `tailscale serve` (tailnet only) instead of
+#     `tailscale funnel` -- the environment is NEVER reachable from the
+#     public internet. Only the broker is.
+#   * One environment per "slot", so several environments can run in
+#     parallel without fighting over the Tailscale hostname or the
+#     cached TLS certificate.
+#   * No GH_PAT is injected. A disposable box does not need push rights.
+#   * Watchdog restarts the MCP servers if they die mid-session.
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Two-digit slot id assigned by the broker (01, 02, ...). Becomes the Tailscale hostname gha-env-<slot>."
+        required: true
+      ttl_minutes:
+        description: "Minutes to keep the environment alive (job hard-stops at 6h anyway)"
+        required: false
+        default: "350"
+      profile:
+        description: "base = SSH MCP only | playwright = SSH MCP + Playwright MCP"
+        required: false
+        default: "base"
+
+# One live environment per slot, and never kill a session that is in use.
+concurrency:
+  group: gha-env-${{ inputs.slot }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      SLOT: ${{ inputs.slot }}
+      PROFILE: ${{ inputs.profile }}
+      TTL_MINUTES: ${{ inputs.ttl_minutes }}
+      SSH_MCP_PORT: "8932"
+      PW_MCP_PORT: "8931"
+
+    steps:
+      - name: Validate slot
+        run: |
+          case "$SLOT" in
+            [0-9][0-9]) echo "slot=$SLOT" ;;
+            *) echo "::error::slot must be exactly two digits (e.g. 01)"; exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install base packages (sshd + mcp-proxy)
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server pipx jq
+          pipx install mcp-proxy || pip install --user mcp-proxy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: |
+          npm install -g @playwright/mcp@latest
+          npx playwright install --with-deps chromium
+
+      - name: Enable sshd + dedicated key for ssh-mcp
+        run: |
+          sudo mkdir -p /run/sshd
+          mkdir -p /home/runner/.ssh
+          ssh-keygen -t ed25519 -N "" -f /home/runner/.ssh/mcp_key <<< y
+          cat /home/runner/.ssh/mcp_key.pub >> /home/runner/.ssh/authorized_keys
+          chmod 700 /home/runner/.ssh
+          chmod 600 /home/runner/.ssh/authorized_keys /home/runner/.ssh/mcp_key
+          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          # ssh-mcp multiplexes every exec call onto ONE ssh connection as a
+          # separate channel. The default MaxSessions (10) is the real ceiling
+          # on parallel tool calls, so raise it.
+          echo "MaxSessions 50" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+          sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
+          echo "sshd ready on 127.0.0.1:22"
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start tailscaled (userspace networking)
+        run: |
+          sudo setsid tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+            --statedir=/var/lib/tailscale < /dev/null > /tmp/tailscaled.log 2>&1 &
+          sleep 5
+
+      - name: Join tailnet as gha-env-<slot>
+        run: |
+          # TS_AUTHKEY must be an EPHEMERAL, reusable, pre-approved key.
+          # Ephemeral nodes are removed automatically when the job ends, which
+          # is why this workflow needs no stale-device cleanup (and therefore
+          # cannot delete a sibling environment by accident).
+          sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
+            --hostname="gha-env-$SLOT" --ssh --accept-routes
+          sleep 3
+          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "TS_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "tailnet host: $HOST"
+          # If the slot was already taken, Tailscale silently appends "-1" and
+          # the broker would talk to the wrong box. Fail loudly instead.
+          case "$HOST" in
+            gha-env-$SLOT.*) ;;
+            *) echo "::error::hostname collision (got $HOST, expected gha-env-$SLOT.*)"; exit 1 ;;
+          esac
+
+      - name: Restore cached TLS certificate for this slot
+        uses: actions/cache/restore@v4
+        with:
+          path: ts-cert-cache
+          key: ts-cert-gha-env-${{ inputs.slot }}-${{ github.run_id }}
+          restore-keys: |
+            ts-cert-gha-env-${{ inputs.slot }}-
+
+      - name: Seed tailscaled with the cached certificate
+        run: |
+          # Hostnames are per-slot (not per-session) precisely so this cache
+          # keeps working: Let's Encrypt rate-limits new certs per tailnet.
+          sudo mkdir -p /var/lib/tailscale/certs
+          if [ -f "ts-cert-cache/$TS_HOST.crt" ] && [ -f "ts-cert-cache/$TS_HOST.key" ]; then
+            sudo cp "ts-cert-cache/$TS_HOST.crt" "/var/lib/tailscale/certs/$TS_HOST.crt"
+            sudo cp "ts-cert-cache/$TS_HOST.key" "/var/lib/tailscale/certs/$TS_HOST.key"
+            sudo chmod 600 "/var/lib/tailscale/certs/$TS_HOST.key"
+            echo "restored cached certificate for $TS_HOST"
+          else
+            echo "no cached certificate for $TS_HOST; a fresh one will be issued"
+          fi
+          sudo timeout 120 tailscale cert \
+            --cert-file "/tmp/$TS_HOST.crt" --key-file "/tmp/$TS_HOST.key" "$TS_HOST" \
+            || echo "tailscale cert non-zero (keeping existing cert store if present)"
+
+      - name: Start SSH MCP (ssh-mcp behind mcp-proxy)
+        run: |
+          sudo tee /usr/local/bin/start-ssh-mcp.sh > /dev/null <<'EOS'
+          #!/usr/bin/env bash
+          export PATH="$HOME/.local/bin:$PATH"
+          setsid mcp-proxy --host 127.0.0.1 --port "${SSH_MCP_PORT:-8932}" -- \
+            npx -y ssh-mcp -- --host=127.0.0.1 --port=22 --user=runner \
+            --key=/home/runner/.ssh/mcp_key --maxChars=none --timeout=600000 \
+            < /dev/null >> /tmp/ssh-mcp.log 2>&1 &
+          EOS
+          sudo chmod +x /usr/local/bin/start-ssh-mcp.sh
+          # --timeout=600000 (10 min): the default 60s makes ssh-mcp kill the
+          # remote process with `pkill -f`, which can also match unrelated
+          # commands. Long timeout + detached long jobs avoids that.
+          /usr/local/bin/start-ssh-mcp.sh
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/"$SSH_MCP_PORT") 2>/dev/null; then
+              exec 3>&- 3<&-; echo "ssh-mcp up on 127.0.0.1:$SSH_MCP_PORT"; break
+            fi
+            sleep 2
+          done
+          cat /tmp/ssh-mcp.log || true
+
+      - name: Start Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: |
+          sudo tee /usr/local/bin/start-pw-mcp.sh > /dev/null <<EOS
+          #!/usr/bin/env bash
+          setsid npx @playwright/mcp@latest --port "${PW_MCP_PORT}" --host 127.0.0.1 --headless \
+            --allowed-hosts "${TS_HOST}" \
+            < /dev/null >> /tmp/pw-mcp.log 2>&1 &
+          EOS
+          sudo chmod +x /usr/local/bin/start-pw-mcp.sh
+          # --allowed-hosts is required (DNS-rebinding guard returns 403 for the
+          # MagicDNS Host header). Do NOT add --allowed-origins: that one is a
+          # browser navigation allowlist and would block every other site.
+          /usr/local/bin/start-pw-mcp.sh
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp"; then
+              echo "playwright mcp up on 127.0.0.1:$PW_MCP_PORT"; break
+            fi
+            sleep 2
+          done
+
+      - name: Publish endpoints on the tailnet (serve, NOT funnel)
+        run: |
+          sudo tailscale serve --bg --https=443 "http://127.0.0.1:$SSH_MCP_PORT"
+          if [ "$PROFILE" = "playwright" ]; then
+            sudo tailscale serve --bg --https=8443 "http://127.0.0.1:$PW_MCP_PORT"
+          fi
+          sleep 2
+          sudo tailscale serve status || true
+          echo "=================================================="
+          echo "  SSH MCP        : https://$TS_HOST/mcp        (tailnet only)"
+          echo "  Playwright MCP : https://$TS_HOST:8443/mcp   (profile=playwright)"
+          echo "  Tailscale SSH  : ssh runner@$TS_HOST"
+          echo "=================================================="
+
+      - name: Persist TLS certificate to the slot cache
+        run: |
+          mkdir -p ts-cert-cache
+          if [ -f "/tmp/$TS_HOST.crt" ] && [ -f "/tmp/$TS_HOST.key" ]; then
+            sudo cp "/tmp/$TS_HOST.crt" "ts-cert-cache/$TS_HOST.crt"
+            sudo cp "/tmp/$TS_HOST.key" "ts-cert-cache/$TS_HOST.key"
+          elif [ -f "/var/lib/tailscale/certs/$TS_HOST.crt" ]; then
+            sudo cp "/var/lib/tailscale/certs/$TS_HOST.crt" "ts-cert-cache/$TS_HOST.crt"
+            sudo cp "/var/lib/tailscale/certs/$TS_HOST.key" "ts-cert-cache/$TS_HOST.key"
+          fi
+          sudo chown -R "$(id -u):$(id -g)" ts-cert-cache || true
+          ls -la ts-cert-cache || true
+
+      - name: Save TLS certificate cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ts-cert-cache
+          key: ts-cert-gha-env-${{ inputs.slot }}-${{ github.run_id }}
+
+      - name: Keep alive with watchdog
+        run: |
+          MIN="${TTL_MINUTES:-350}"
+          case "$MIN" in ''|*[!0-9]*) MIN=350;; esac
+          [ "$MIN" -le 0 ] && MIN=350
+          [ "$MIN" -gt 350 ] && MIN=350
+          echo "holding environment for $MIN minutes (broker can end it early via /tmp/stop.txt)"
+          END=$(( $(date +%s) + MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if [ -f /tmp/stop.txt ]; then echo "stop.txt detected -- shutting down"; break; fi
+            if ! (exec 3<>/dev/tcp/127.0.0.1/"$SSH_MCP_PORT") 2>/dev/null; then
+              echo "$(date -Is) ssh-mcp is down, restarting"
+              /usr/local/bin/start-ssh-mcp.sh
+            else
+              exec 3>&- 3<&-
+            fi
+            if [ "$PROFILE" = "playwright" ]; then
+              curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp" \
+                || { echo "$(date -Is) playwright mcp is down, restarting"; /usr/local/bin/start-pw-mcp.sh; }
+            fi
+            sleep 30
+          done
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p env-logs
+          for f in /tmp/ssh-mcp.log /tmp/pw-mcp.log /tmp/tailscaled.log; do
+            [ -f "$f" ] && cp "$f" env-logs/ || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-logs-slot${{ inputs.slot }}-${{ github.run_id }}
+          path: env-logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: |
+          sudo tailscale serve --https=443 off || true
+          sudo tailscale serve --https=8443 off || true
+          # Ephemeral auth key => the node disappears from the tailnet by itself.
+          sudo tailscale logout || true
