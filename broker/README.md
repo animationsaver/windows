@@ -56,9 +56,14 @@ On a host that has already joined your tailnet:
 ```bash
 cd broker
 cp .env.example .env && $EDITOR .env
-docker compose up -d --build
+docker compose up -d          # pulls ghcr.io/animationsaver/windows/broker
 curl localhost:8080/healthz
 ```
+
+The image is built and published by
+`.github/workflows/broker-image.yml` (linux/amd64 + linux/arm64), so nothing is
+compiled on the broker host. Update with `docker compose pull && docker compose
+up -d`, or build locally with `docker compose up -d --build`.
 
 The container uses `network_mode: host` so it can resolve MagicDNS names
 through the host's tailscaled.
@@ -72,10 +77,6 @@ tailscale funnel --bg --https=443 http://127.0.0.1:8080
 This is the one and only public entry point. Connect Notion to
 `https://<broker-host>.<tailnet>.ts.net/mcp` with the `BROKER_TOKEN` as a
 bearer token.
-
-> `workflow_dispatch` can only start workflows that exist on the default
-> branch, so `ephemeral-env.yml` must be merged into `main` before the broker
-> can provision anything.
 
 ## Tools
 
