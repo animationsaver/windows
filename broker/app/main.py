@@ -51,6 +51,7 @@ DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
 
+API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 
 
@@ -145,6 +146,10 @@ def host_for(slot: str) -> str:
     return f"gha-env-{slot}.{TAILNET_DOMAIN}"
 
 
+def mcp_url(host: str) -> str:
+    return "https://" + host + "/mcp"
+
+
 # --------------------------------------------------------------------------
 # github + upstream MCP
 # --------------------------------------------------------------------------
@@ -152,7 +157,7 @@ def host_for(slot: str) -> str:
 
 async def dispatch_workflow(slot: str, ttl_minutes: int, profile: str) -> None:
     url = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"{API_ROOT}/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
         f"/actions/workflows/{WORKFLOW_FILE}/dispatches"
     )
     payload = {
@@ -182,9 +187,8 @@ async def upstream_call(
     host: str, tool: str, arguments: dict[str, Any], timeout: int = 180
 ) -> str:
     """Call a tool on the environment's ssh-mcp (via mcp-proxy)."""
-    url = f"https://{host}/mcp"
     async with streamablehttp_client(
-        url,
+        mcp_url(host),
         timeout=timedelta(seconds=timeout),
         sse_read_timeout=timedelta(seconds=timeout + 60),
     ) as (read, write, _):
@@ -201,9 +205,8 @@ async def upstream_call(
 
 async def probe(host: str, timeout: int = 15) -> bool:
     try:
-        url = f"https://{host}/mcp"
         async with streamablehttp_client(
-            url, timeout=timedelta(seconds=timeout)
+            mcp_url(host), timeout=timedelta(seconds=timeout)
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -362,7 +365,10 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
     try:
         # The workflow's keep-alive loop watches for this file.
         await upstream_call(
-            host_for(row["slot"]), "exec", {"command": "touch /tmp/stop.txt"}, timeout=30
+            host_for(row["slot"]),
+            "exec",
+            {"command": "touch /tmp/stop.txt"},
+            timeout=30,
         )
         stopped = True
     except Exception:
