@@ -1,111 +1,107 @@
-# gha-env-broker
+# Ephemeral environment broker
 
-A small always-on MCP server that hands out **disposable Linux environments**,
-one per conversation, backed by GitHub Actions runners.
+A small always-on MCP server that hands out disposable Linux boxes running on
+GitHub Actions runners, one per conversation.
 
 ```
-Notion / any MCP client
-        │  HTTPS + Bearer token
-        ▼
-   broker (Docker, on your tailnet)          <-- the only public surface
-        │  workflow_dispatch (slot, ttl, profile)   -- nothing secret
-        ▼
-   GitHub Actions runner "gha-env-NN"
-        │  tailscale serve (tailnet only, NEVER funnel)
-        └─ mcp-proxy ── ssh-mcp ── sshd (localhost)
+Notion ──HTTPS + Bearer──▶ broker (Docker, on your tailnet)
+                              │  workflow_dispatch(env_host, ttl, profile)
+                              ▼
+                      GitHub Actions runner  "gha-env-<random>"
+                              │  tailscale serve --http=8932  (tailnet only)
+                              ▼
+                      mcp-proxy ──▶ ssh-mcp ──▶ sshd
 ```
 
 ## Why it is built this way
 
-| Risk in the older single-box setup | How this design removes it |
-| --- | --- |
-| MCP endpoint published with `tailscale funnel`, unauthenticated | Environments use `tailscale serve` (tailnet only). Only the broker is public, behind a bearer token. |
-| Every client shared one box, one OS user, one SSH connection | One runner per session. No shared filesystem, no shared SSH connection, no `pkill -f` collateral damage. |
-| `GH_PAT` written to `~/.git-credentials` on a world-reachable box | No PAT is injected into environments at all. |
-| Stale-device cleanup deleted siblings by hostname prefix | Ephemeral auth keys; no cleanup step; one slot per concurrency group. |
-| Nothing restarted a crashed MCP server | Watchdog loop in the keep-alive step. |
-| Session ids in workflow inputs would be public | Inputs carry only the slot number. The secret `env_id` never leaves the broker. |
+**Only the broker is public.** Environments are published with
+`tailscale serve`, not `tailscale funnel`, so they are reachable from inside
+your tailnet and nowhere else. `serve` is required even for that: tailscaled
+runs in userspace-networking mode on the runner, so without a serve rule there
+is no path from the tailnet into a localhost port.
+
+**No TLS on the tailnet leg.** Broker-to-environment traffic is already
+encrypted by WireGuard. Terminating TLS there would add a Let's Encrypt
+dependency plus its per-tailnet rate limits (`ts.net` is on the Public Suffix
+List, so every environment would draw from the same quota) in exchange for a
+second, redundant layer of encryption.
+
+**`env_id` is the only credential.** It is 256 bits from `secrets.token_urlsafe`
+and lives exclusively in the broker's SQLite database. The workflow is
+dispatched with nothing but a random hostname, a TTL and a profile name, so it
+does not matter that workflow inputs are world-readable on a public repository.
+Every tool call must carry `env_id`; it is a required parameter rather than a
+string prefix, so it cannot be forgotten or mangled by quoting.
+
+**Ephemeral Tailscale nodes.** Devices deregister themselves when the job ends,
+so there is no cleanup step that could delete a sibling environment by mistake.
 
 ## Setup
 
 ### 1. Tailscale auth key
 
-Create a key in the Tailscale admin console with **Reusable**, **Ephemeral**
-and **Pre-approved** enabled (tag it, e.g. `tag:gha-env`, and restrict that tag
-in your ACLs so environments can only reach what they need).
-
-Add it to the repository as the secret `TS_AUTHKEY`. MagicDNS and HTTPS
-certificates must be enabled for the tailnet.
+Create a key at <https://login.tailscale.com/admin/settings/keys> with
+**Ephemeral**, **Reusable** and **Pre-approved** enabled (tag it if your ACLs
+require one), and store it as the repository secret `TS_AUTHKEY`.
 
 ### 2. GitHub token
 
-Fine-grained PAT, this repository only, **Actions: Read and write**.
+A fine-grained PAT limited to this repository with **Actions: Read and write**.
 
 ### 3. Run the broker
 
+On a host that has already joined your tailnet:
+
 ```bash
 cd broker
-cp .env.example .env   # fill in GITHUB_TOKEN, TAILNET_DOMAIN, BROKER_TOKEN
+cp .env.example .env && $EDITOR .env
 docker compose up -d --build
 curl localhost:8080/healthz
 ```
 
-The container uses host networking so it can reach `100.64.0.0/10` and resolve
-MagicDNS names via the host's `tailscaled`.
+The container uses `network_mode: host` so it can resolve MagicDNS names
+through the host's tailscaled.
 
-### 4. Expose the broker (and only the broker)
+### 4. Expose the broker
 
 ```bash
 tailscale funnel --bg --https=443 http://127.0.0.1:8080
 ```
 
-Endpoint for MCP clients: `https://<broker-host>.<tailnet>.ts.net/mcp`
-with header `Authorization: Bearer $BROKER_TOKEN`.
+This is the one and only public entry point. Connect Notion to
+`https://<broker-host>.<tailnet>.ts.net/mcp` with the `BROKER_TOKEN` as a
+bearer token.
 
-If your client lives inside the tailnet, use `tailscale serve` instead and skip
-public exposure entirely.
+> `workflow_dispatch` can only start workflows that exist on the default
+> branch, so `ephemeral-env.yml` must be merged into `main` before the broker
+> can provision anything.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `create_env(ttl_minutes, profile, label)` | Provision a box, return the secret `env_id`. Returns immediately. |
-| `wait_ready(env_id, max_wait_seconds)` | Poll until the box answers (boot is 2-5 min). |
-| `env_status(env_id)` | `provisioning` / `ready` + expiry. |
-| `exec(env_id, command, timeout_seconds)` | Run a command. |
-| `sudo_exec(env_id, command, timeout_seconds)` | Run it as root. |
-| `destroy_env(env_id)` | Stop the runner, free the slot. |
-| `list_envs()` | Live environments, `env_id`s masked. |
+| `create_env(ttl_minutes, profile, label)` | Provision a box; returns the secret `env_id`. Returns immediately — boot takes 2–5 minutes. |
+| `wait_ready(env_id, max_wait_seconds)` | Poll until the box answers. |
+| `env_status(env_id)` | `provisioning` / `ready` plus expiry. |
+| `exec(env_id, command, timeout_seconds)` | Run a command as `runner`. |
+| `sudo_exec(env_id, command, timeout_seconds)` | Run a command as root. |
+| `destroy_env(env_id)` | Stop the runner and free capacity. |
+| `list_envs()` | Live environments, with `env_id` masked. |
 
-Typical conversation:
-
-```
-create_env(profile="base")      -> env_id = "kQ8..."
-wait_ready(env_id)              -> ready
-exec(env_id, "uname -a")
-...
-destroy_env(env_id)
-```
-
-`profile="playwright"` additionally starts a Playwright MCP server on
-`https://gha-env-NN.<tailnet>:8443/mcp` (reachable from the tailnet; the broker
-does not proxy it).
+Profiles: `base` (SSH only) or `playwright` (also starts a Playwright MCP
+server on port 8931).
 
 ## Operational notes
 
-* **Slots.** `SLOT_COUNT` fixed hostnames (`gha-env-01` …) are recycled. Fixed
-  names keep the cached TLS certificate usable — Let's Encrypt rate-limits new
-  certificates per tailnet, so *don't* switch to a random hostname per session.
-* **No shell state between calls.** Every `exec` opens a new SSH channel, so
-  `cd` does not persist. Chain with `&&`.
-* **Long jobs.** `ssh-mcp` runs with `--timeout=600000` (10 min) and kills
-  overrunning commands with `pkill -f`. Detach anything longer:
-  `nohup ... > /tmp/job.log 2>&1 &`.
-* **Everything is lost at teardown.** Push results to git or copy them out
-  before the TTL expires; the 6 h job limit is a hard ceiling.
-* **Restart policy.** The broker's SQLite lives in the `broker-data` volume, so
-  restarts keep the env registry. Environments that died meanwhile simply fail
-  their next `exec` and can be recreated.
-* GitHub caps concurrent Actions jobs per account, so keep `SLOT_COUNT` well
-  below that limit and remember this is best treated as CI-adjacent scratch
-  capacity, not a hosting platform.
+- Each `exec` opens its own SSH channel, so calls run genuinely in parallel.
+  Working directory and shell variables do **not** persist between calls —
+  chain with `cd /path && ...`.
+- ssh-mcp is started with `--timeout=600000`. Its default of 60 s makes it kill
+  the remote process with `pkill -f`, which can match unrelated commands.
+  For anything long, detach: `nohup ... > /tmp/job.log 2>&1 &`.
+- `sshd` is configured with `MaxSessions 50`, since the default of 10 caps how
+  many tool calls can run at once over the single SSH connection.
+- Jobs are hard-stopped by GitHub after 6 hours regardless of TTL.
+- A watchdog restarts the MCP servers if they crash mid-session; logs are
+  uploaded as a run artifact.

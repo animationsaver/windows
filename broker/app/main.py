@@ -3,19 +3,19 @@
 The broker is the only component exposed to the internet. It:
 
   1. mints a high-entropy ``env_id`` per conversation/session,
-  2. dispatches ``ephemeral-env.yml`` on a free *slot*,
+  2. dispatches ``ephemeral-env.yml`` with a random hostname,
   3. proxies ``exec`` / ``sudo_exec`` to the environment that owns that
      ``env_id`` over the tailnet.
 
 Design notes
 ------------
-* ``env_id`` is a capability. It never leaves the broker: the workflow only
-  ever receives the (non-secret) slot number, so a public repository leaking
-  its workflow inputs leaks nothing useful.
-* Environments are published with ``tailscale serve``, i.e. tailnet-only.
-  Even somebody who guesses a slot cannot reach the box from outside.
-* Hostnames are per-slot rather than per-session so the Let's Encrypt
-  certificate cache in the workflow stays effective.
+* ``env_id`` is a capability and never leaves the broker. The workflow only
+  receives the hostname, which is meaningless outside the tailnet, so a
+  public repository leaking its workflow inputs leaks nothing useful.
+* Environments are published with ``tailscale serve`` over plain HTTP. The
+  hop is already encrypted by WireGuard; adding TLS there would only buy a
+  Let's Encrypt dependency and its per-tailnet rate limits.
+* Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import asyncio
 import os
 import secrets
 import sqlite3
+import string
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -46,13 +47,15 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "windows")
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "ephemeral-env.yml")
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
-SLOT_COUNT = int(os.environ.get("SLOT_COUNT", "6"))
+ENV_MCP_PORT = int(os.environ.get("ENV_MCP_PORT", "8932"))
+MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
 
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
+HOST_ALPHABET = string.ascii_lowercase + string.digits
 
 
 def now() -> datetime:
@@ -82,7 +85,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS envs (
                 env_id     TEXT PRIMARY KEY,
-                slot       TEXT NOT NULL,
+                host_id    TEXT NOT NULL,
                 profile    TEXT NOT NULL,
                 state      TEXT NOT NULL,
                 label      TEXT,
@@ -92,12 +95,8 @@ def init_db() -> None:
             )
             """
         )
-        # At most one live environment per slot.
         conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_live_slot
-            ON envs(slot) WHERE state IN ('provisioning', 'ready')
-            """
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_host_id ON envs(host_id)"
         )
 
 
@@ -110,25 +109,22 @@ def reap() -> None:
         )
 
 
-def free_slot() -> str | None:
+def live_count() -> int:
     with db() as conn:
-        taken = {
-            r["slot"]
-            for r in conn.execute(
-                "SELECT slot FROM envs WHERE state IN (?, ?)", ACTIVE_STATES
-            )
-        }
-    for i in range(1, SLOT_COUNT + 1):
-        slot = f"{i:02d}"
-        if slot not in taken:
-            return slot
-    return None
+        return conn.execute(
+            "SELECT COUNT(*) FROM envs WHERE state IN (?, ?)", ACTIVE_STATES
+        ).fetchone()[0]
+
+
+def new_host_id() -> str:
+    return "".join(secrets.choice(HOST_ALPHABET) for _ in range(12))
 
 
 def get_env(env_id: str) -> sqlite3.Row | None:
     with db() as conn:
-        cur = conn.execute("SELECT * FROM envs WHERE env_id = ?", (env_id,))
-        return cur.fetchone()
+        return conn.execute(
+            "SELECT * FROM envs WHERE env_id = ?", (env_id,)
+        ).fetchone()
 
 
 def set_state(env_id: str, state: str, ready: bool = False) -> None:
@@ -142,12 +138,12 @@ def set_state(env_id: str, state: str, ready: bool = False) -> None:
             conn.execute("UPDATE envs SET state=? WHERE env_id=?", (state, env_id))
 
 
-def host_for(slot: str) -> str:
-    return f"gha-env-{slot}.{TAILNET_DOMAIN}"
+def host_for(host_id: str) -> str:
+    return "gha-env-" + host_id + "." + TAILNET_DOMAIN
 
 
 def mcp_url(host: str) -> str:
-    return "https://" + host + "/mcp"
+    return "http://" + host + ":" + str(ENV_MCP_PORT) + "/mcp"
 
 
 # --------------------------------------------------------------------------
@@ -155,23 +151,30 @@ def mcp_url(host: str) -> str:
 # --------------------------------------------------------------------------
 
 
-async def dispatch_workflow(slot: str, ttl_minutes: int, profile: str) -> None:
+async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> None:
     url = (
-        f"{API_ROOT}/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-        f"/actions/workflows/{WORKFLOW_FILE}/dispatches"
+        API_ROOT
+        + "/repos/"
+        + GITHUB_OWNER
+        + "/"
+        + GITHUB_REPO
+        + "/actions/workflows/"
+        + WORKFLOW_FILE
+        + "/dispatches"
     )
     payload = {
         "ref": WORKFLOW_REF,
         # Nothing secret here on purpose: workflow inputs are readable by
-        # anyone who can read the repository.
+        # anyone who can read the repository. The hostname is only routable
+        # inside the tailnet, and env_id never appears here.
         "inputs": {
-            "slot": slot,
+            "env_host": host_id,
             "ttl_minutes": str(ttl_minutes),
             "profile": profile,
         },
     }
     headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Authorization": "Bearer " + GITHUB_TOKEN,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -179,7 +182,10 @@ async def dispatch_workflow(slot: str, ttl_minutes: int, profile: str) -> None:
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code not in (202, 204):
         raise RuntimeError(
-            f"workflow_dispatch failed: {resp.status_code} {resp.text[:300]}"
+            "workflow_dispatch failed: "
+            + str(resp.status_code)
+            + " "
+            + resp.text[:300]
         )
 
 
@@ -225,7 +231,7 @@ async def resolve(env_id: str) -> sqlite3.Row:
         await asyncio.sleep(0.5)
         raise ValueError("unknown or expired env_id")
     if row["state"] not in ACTIVE_STATES:
-        raise ValueError(f"environment is {row['state']}; create a new one")
+        raise ValueError("environment is " + row["state"] + "; create a new one")
     return row
 
 
@@ -263,24 +269,25 @@ async def create_env(
     ttl_minutes = max(1, min(int(ttl_minutes), 350))
 
     reap()
-    slot = free_slot()
-    if slot is None:
+    if live_count() >= MAX_ENVS:
         raise RuntimeError(
-            f"all {SLOT_COUNT} slots are in use; destroy_env one first "
-            "or raise SLOT_COUNT"
+            "already running "
+            + str(MAX_ENVS)
+            + " environments; destroy_env one first or raise MAX_ENVS"
         )
 
     env_id = secrets.token_urlsafe(32)
+    host_id = new_host_id()
     created = now()
     expires = created + timedelta(minutes=ttl_minutes)
     with db() as conn:
         conn.execute(
-            "INSERT INTO envs (env_id, slot, profile, state, label, created_at, expires_at)"
+            "INSERT INTO envs (env_id, host_id, profile, state, label, created_at, expires_at)"
             " VALUES (?, ?, ?, 'provisioning', ?, ?, ?)",
-            (env_id, slot, profile, label, iso(created), iso(expires)),
+            (env_id, host_id, profile, label, iso(created), iso(expires)),
         )
     try:
-        await dispatch_workflow(slot, ttl_minutes, profile)
+        await dispatch_workflow(host_id, ttl_minutes, profile)
     except Exception:
         with db() as conn:
             conn.execute("DELETE FROM envs WHERE env_id = ?", (env_id,))
@@ -288,7 +295,7 @@ async def create_env(
 
     return {
         "env_id": env_id,
-        "slot": slot,
+        "host": host_for(host_id),
         "profile": profile,
         "state": "provisioning",
         "expires_at": iso(expires),
@@ -301,17 +308,13 @@ async def create_env(
 async def env_status(env_id: str) -> dict[str, Any]:
     """Report whether the environment is still provisioning or ready to use."""
     row = await resolve(env_id)
-    host = host_for(row["slot"])
+    host = host_for(row["host_id"])
     if row["state"] == "ready":
-        return {"state": "ready", "slot": row["slot"], "expires_at": row["expires_at"]}
+        return {"state": "ready", "host": host, "expires_at": row["expires_at"]}
     if await probe(host):
         set_state(env_id, "ready", ready=True)
-        return {"state": "ready", "slot": row["slot"], "expires_at": row["expires_at"]}
-    return {
-        "state": "provisioning",
-        "slot": row["slot"],
-        "expires_at": row["expires_at"],
-    }
+        return {"state": "ready", "host": host, "expires_at": row["expires_at"]}
+    return {"state": "provisioning", "host": host, "expires_at": row["expires_at"]}
 
 
 @mcp.tool()
@@ -338,7 +341,7 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """
     row = await resolve(env_id)
     return await upstream_call(
-        host_for(row["slot"]),
+        host_for(row["host_id"]),
         "exec",
         {"command": command},
         timeout=max(10, min(int(timeout_seconds), 600)),
@@ -350,7 +353,7 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
     """Run a shell command as root inside the environment identified by env_id."""
     row = await resolve(env_id)
     return await upstream_call(
-        host_for(row["slot"]),
+        host_for(row["host_id"]),
         "sudo-exec",
         {"command": command},
         timeout=max(10, min(int(timeout_seconds), 600)),
@@ -359,13 +362,13 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
 
 @mcp.tool()
 async def destroy_env(env_id: str) -> dict[str, Any]:
-    """Shut the environment down now and release its slot."""
+    """Shut the environment down now and free up capacity."""
     row = await resolve(env_id)
     stopped = False
     try:
         # The workflow's keep-alive loop watches for this file.
         await upstream_call(
-            host_for(row["slot"]),
+            host_for(row["host_id"]),
             "exec",
             {"command": "touch /tmp/stop.txt"},
             timeout=30,
@@ -376,8 +379,8 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
     set_state(env_id, "destroyed")
     return {
         "state": "destroyed",
-        "slot_released": row["slot"],
         "graceful": stopped,
+        "live": live_count(),
         "note": "the runner takes up to ~30s to notice and exit",
     }
 
@@ -393,7 +396,7 @@ async def list_envs() -> list[dict[str, Any]]:
         ).fetchall()
     return [
         {
-            "slot": r["slot"],
+            "host": host_for(r["host_id"]),
             "state": r["state"],
             "profile": r["profile"],
             "label": r["label"],
@@ -428,11 +431,7 @@ class BearerAuth(BaseHTTPMiddleware):
 
 async def healthz(_: Request) -> PlainTextResponse:
     reap()
-    with db() as conn:
-        live = conn.execute(
-            "SELECT COUNT(*) FROM envs WHERE state IN (?, ?)", ACTIVE_STATES
-        ).fetchone()[0]
-    return PlainTextResponse(f"ok live={live}/{SLOT_COUNT}\n")
+    return PlainTextResponse("ok live=" + str(live_count()) + "/" + str(MAX_ENVS) + "\n")
 
 
 init_db()
