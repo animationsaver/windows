@@ -1,0 +1,20 @@
+services:
+  broker:
+    build: .
+    image: gha-env-broker:latest
+    container_name: gha-env-broker
+    restart: unless-stopped
+    env_file: .env
+    # Host networking so the container can reach the tailnet (100.64.0.0/10)
+    # and resolve MagicDNS names through the host's tailscaled.
+    network_mode: host
+    volumes:
+      - broker-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  broker-data:
