@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import secrets
@@ -82,6 +83,10 @@ log = logging.getLogger("broker")
 logging.getLogger("asyncssh").setLevel(
     logging.DEBUG if LOG_LEVEL == "DEBUG" else logging.WARNING
 )
+
+# sse_starlette emits a DEBUG line per keepalive per open stream, which at
+# DEBUG drowns out everything else without saying anything useful.
+logging.getLogger("sse_starlette.sse").setLevel(logging.INFO)
 
 
 def short(value: Any) -> str:
@@ -808,22 +813,61 @@ async def list_envs() -> list[dict[str, Any]]:
 # HTTP app
 # --------------------------------------------------------------------------
 
+MAX_PEEK = 4096
+
 
 class RequestLog(BaseHTTPMiddleware):
-    """One line per request, so failures that never reach a tool are visible."""
+    """One line per request, including what the client asked for.
+
+    Without the JSON-RPC method and the MCP headers there is no way to tell a
+    client that is failing from one that is merely reconnecting, since both
+    look like a stream of 200s.
+    """
 
     async def dispatch(self, request: Request, call_next):
+        method = "-"
+        if request.method == "POST" and request.url.path.startswith("/mcp"):
+            body = await request.body()
+            # request.body() drains the receive channel, so hand the app a
+            # replacement that replays what we just read.
+            request._receive = self._replay(body)  # type: ignore[attr-defined]
+            if len(body) <= MAX_PEEK:
+                try:
+                    parsed = json.loads(body)
+                    if isinstance(parsed, dict):
+                        method = str(parsed.get("method", "-"))
+                except Exception:
+                    method = "?"
+
         started = time.monotonic()
         response = await call_next(request)
+        headers = request.headers
         log.info(
-            "%s %s -> %s (%.2fs) host=%s",
+            "%s %s %s -> %s (%.2fs) accept=%r proto=%s session=%s ua=%r",
             request.method,
             request.url.path,
+            method,
             response.status_code,
             time.monotonic() - started,
-            request.headers.get("host", "-"),
+            headers.get("accept", "-"),
+            headers.get("mcp-protocol-version", "-"),
+            headers.get("mcp-session-id", "-"),
+            headers.get("user-agent", "-")[:60],
         )
         return response
+
+    @staticmethod
+    def _replay(body: bytes):
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return receive
 
 
 class BearerAuth(BaseHTTPMiddleware):
