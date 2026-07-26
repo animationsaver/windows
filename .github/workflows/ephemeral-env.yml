@@ -4,19 +4,14 @@ name: Ephemeral MCP Env (broker-managed)
 #
 # Differences from ubuntu-playwright-mcp.yml (which is left untouched):
 #   * Started on demand by the broker, never by cron.
-#   * Published with `tailscale serve --http` (tailnet only) instead of
-#     `tailscale funnel` -- the environment is NEVER reachable from the
-#     public internet. Only the broker is.
-#   * Plain HTTP on the tailnet leg. Traffic between the broker and this
-#     box is already encrypted by WireGuard, so terminating TLS here would
-#     only add a second layer, a Let's Encrypt dependency, and per-tailnet
-#     rate limits. `serve` is still required because tailscaled runs in
-#     userspace-networking mode: without a serve rule there is no path
-#     from the tailnet into a localhost port.
+#   * The shell is reached over Tailscale SSH, which tailscaled terminates
+#     itself. There is no sshd, no ssh-mcp and no mcp-proxy on this box, and
+#     nothing listens on the tailnet for the base profile.
+#   * Access is authenticated by the tailnet identity of the caller, so an
+#     ACL rule can allow the broker and nobody else.
 #   * Hostname is a random id chosen by the broker, so two environments
 #     can never collide.
 #   * No GH_PAT is injected. A disposable box does not need push rights.
-#   * Watchdog restarts the MCP servers if they die mid-session.
 
 on:
   workflow_dispatch:
@@ -29,7 +24,7 @@ on:
         required: false
         default: "350"
       profile:
-        description: "base = SSH MCP only | playwright = SSH MCP + Playwright MCP"
+        description: "base = shell only | playwright = shell + Playwright MCP"
         required: false
         default: "base"
 
@@ -46,7 +41,6 @@ jobs:
       ENV_HOST: ${{ inputs.env_host }}
       PROFILE: ${{ inputs.profile }}
       TTL_MINUTES: ${{ inputs.ttl_minutes }}
-      SSH_MCP_PORT: "8932"
       PW_MCP_PORT: "8931"
 
     steps:
@@ -61,39 +55,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Install base packages
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+
+      - name: Setup Node.js (profile=playwright)
+        if: inputs.profile == 'playwright'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install base packages (sshd + mcp-proxy)
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server pipx jq
-          pipx install mcp-proxy || pip install --user mcp-proxy
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Playwright MCP (profile=playwright)
         if: inputs.profile == 'playwright'
         run: |
           npm install -g @playwright/mcp@latest
           npx playwright install --with-deps chromium
-
-      - name: Enable sshd + dedicated key for ssh-mcp
-        run: |
-          sudo mkdir -p /run/sshd
-          mkdir -p /home/runner/.ssh
-          ssh-keygen -t ed25519 -N "" -f /home/runner/.ssh/mcp_key <<< y
-          cat /home/runner/.ssh/mcp_key.pub >> /home/runner/.ssh/authorized_keys
-          chmod 700 /home/runner/.ssh
-          chmod 600 /home/runner/.ssh/authorized_keys /home/runner/.ssh/mcp_key
-          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          # ssh-mcp multiplexes every exec call onto ONE ssh connection as a
-          # separate channel. The default MaxSessions (10) is the real ceiling
-          # on parallel tool calls, so raise it.
-          echo "MaxSessions 50" | sudo tee -a /etc/ssh/sshd_config > /dev/null
-          sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
-          echo "sshd ready on 127.0.0.1:22"
 
       - name: Install Tailscale
         run: curl -fsSL https://tailscale.com/install.sh | sh
@@ -110,6 +87,10 @@ jobs:
           # Ephemeral nodes are removed automatically when the job ends, which
           # is why this workflow needs no stale-device cleanup (and therefore
           # cannot delete a sibling environment by accident).
+          #
+          # --ssh starts the SSH server built into tailscaled. It works under
+          # userspace-networking because tailscaled handles the connection
+          # in-process; no serve rule and no sshd are involved.
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
             --hostname="gha-env-$ENV_HOST" --ssh --accept-routes
           sleep 3
@@ -123,28 +104,17 @@ jobs:
             *) echo "::error::hostname collision (got $HOST, expected gha-env-$ENV_HOST.*)"; exit 1 ;;
           esac
 
-      - name: Start SSH MCP (ssh-mcp behind mcp-proxy)
+      - name: Verify Tailscale SSH is accepting
         run: |
-          sudo tee /usr/local/bin/start-ssh-mcp.sh > /dev/null <<'EOS'
-          #!/usr/bin/env bash
-          export PATH="$HOME/.local/bin:$PATH"
-          setsid mcp-proxy --host 127.0.0.1 --port "${SSH_MCP_PORT:-8932}" -- \
-            npx -y ssh-mcp -- --host=127.0.0.1 --port=22 --user=runner \
-            --key=/home/runner/.ssh/mcp_key --maxChars=none --timeout=600000 \
-            < /dev/null >> /tmp/ssh-mcp.log 2>&1 &
-          EOS
-          sudo chmod +x /usr/local/bin/start-ssh-mcp.sh
-          # --timeout=600000 (10 min): the default 60s makes ssh-mcp kill the
-          # remote process with `pkill -f`, which can also match unrelated
-          # commands. Long timeout + detached long jobs avoids that.
-          /usr/local/bin/start-ssh-mcp.sh
-          for i in $(seq 1 30); do
-            if (exec 3<>/dev/tcp/127.0.0.1/"$SSH_MCP_PORT") 2>/dev/null; then
-              exec 3>&- 3<&-; echo "ssh-mcp up on 127.0.0.1:$SSH_MCP_PORT"; break
+          # Confirms the ACL actually grants ssh to this node. Failing here is
+          # far easier to diagnose than a broker timeout ten minutes later.
+          for i in $(seq 1 15); do
+            if tailscale status --json | jq -e '.Self.Capabilities // [] | index("ssh")' > /dev/null 2>&1; then
+              echo "tailscale ssh advertised"; break
             fi
             sleep 2
           done
-          cat /tmp/ssh-mcp.log || true
+          tailscale status || true
 
       - name: Start Playwright MCP (profile=playwright)
         if: inputs.profile == 'playwright'
@@ -166,25 +136,20 @@ jobs:
             fi
             sleep 2
           done
-
-      - name: Publish endpoints on the tailnet (serve, NOT funnel)
-        run: |
-          # Plain HTTP on purpose: the tailnet leg is already WireGuard.
-          # `serve` is what bridges tailnet -> localhost under
-          # userspace-networking; it does not expose anything publicly.
-          sudo tailscale serve --bg --http="$SSH_MCP_PORT" "http://127.0.0.1:$SSH_MCP_PORT"
-          if [ "$PROFILE" = "playwright" ]; then
-            sudo tailscale serve --bg --http="$PW_MCP_PORT" "http://127.0.0.1:$PW_MCP_PORT"
-          fi
-          sleep 2
+          # Playwright MCP speaks HTTP, so unlike the shell it does need a
+          # serve rule to be reachable under userspace-networking. Still
+          # tailnet-only: `serve`, never `funnel`.
+          sudo tailscale serve --bg --http="$PW_MCP_PORT" "http://127.0.0.1:$PW_MCP_PORT"
           sudo tailscale serve status || true
+
+      - name: Announce endpoints
+        run: |
           echo "=================================================="
-          echo "  SSH MCP        : http://$TS_HOST:$SSH_MCP_PORT/mcp   (tailnet only)"
-          echo "  Playwright MCP : http://$TS_HOST:$PW_MCP_PORT/mcp    (profile=playwright)"
-          echo "  Tailscale SSH  : ssh runner@$TS_HOST"
+          echo "  Shell          : ssh runner@$TS_HOST   (Tailscale SSH, ACL gated)"
+          echo "  Playwright MCP : http://$TS_HOST:$PW_MCP_PORT/mcp   (profile=playwright)"
           echo "=================================================="
 
-      - name: Keep alive with watchdog
+      - name: Keep alive
         run: |
           MIN="${TTL_MINUTES:-350}"
           case "$MIN" in ''|*[!0-9]*) MIN=350;; esac
@@ -194,11 +159,10 @@ jobs:
           END=$(( $(date +%s) + MIN * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             if [ -f /tmp/stop.txt ]; then echo "stop.txt detected -- shutting down"; break; fi
-            if ! (exec 3<>/dev/tcp/127.0.0.1/"$SSH_MCP_PORT") 2>/dev/null; then
-              echo "$(date -Is) ssh-mcp is down, restarting"
-              /usr/local/bin/start-ssh-mcp.sh
-            else
-              exec 3>&- 3<&-
+            # The shell has no daemon of its own to babysit; if tailscaled is
+            # gone the box is unreachable and there is nothing to recover.
+            if ! tailscale status > /dev/null 2>&1; then
+              echo "$(date -Is) tailscaled is not responding"
             fi
             if [ "$PROFILE" = "playwright" ]; then
               curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp" \
@@ -211,7 +175,7 @@ jobs:
         if: always()
         run: |
           mkdir -p env-logs
-          for f in /tmp/ssh-mcp.log /tmp/pw-mcp.log /tmp/tailscaled.log; do
+          for f in /tmp/pw-mcp.log /tmp/tailscaled.log; do
             [ -f "$f" ] && cp "$f" env-logs/ || true
           done
 
@@ -227,7 +191,6 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          sudo tailscale serve --http="$SSH_MCP_PORT" off || true
           sudo tailscale serve --http="$PW_MCP_PORT" off || true
           # Ephemeral auth key => the node disappears from the tailnet by itself.
           sudo tailscale logout || true

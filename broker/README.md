@@ -8,31 +8,45 @@ Notion ──HTTPS + Bearer──▶ broker (Docker, on your tailnet)
                               │  workflow_dispatch(env_host, ttl, profile)
                               ▼
                       GitHub Actions runner  "gha-env-<random>"
-                              │  tailscale serve --http=8932  (tailnet only)
-                              ▼
-                      mcp-proxy ──▶ ssh-mcp ──▶ sshd
+                              ▲
+                              └── SSH over the tailnet, terminated by
+                                  tailscaled's built-in SSH server
 ```
 
 ## Why it is built this way
 
-**Only the broker is public.** Environments are published with
-`tailscale serve`, not `tailscale funnel`, so they are reachable from inside
-your tailnet and nowhere else. `serve` is required even for that: tailscaled
-runs in userspace-networking mode on the runner, so without a serve rule there
-is no path from the tailnet into a localhost port.
+**Only the broker is public.** The environment listens on nothing at all for
+the `base` profile. Its shell is reached through Tailscale SSH, which
+tailscaled handles in-process, so it works under userspace-networking with no
+`serve` rule, no sshd and no open port.
 
-**No TLS on the tailnet leg.** Broker-to-environment traffic is already
-encrypted by WireGuard. Terminating TLS there would add a Let's Encrypt
-dependency plus its per-tailnet rate limits (`ts.net` is on the Public Suffix
-List, so every environment would draw from the same quota) in exchange for a
-second, redundant layer of encryption.
+**The caller is authenticated by the tailnet.** Tailscale SSH checks the
+identity of the connecting node against your ACLs, so execution can be
+restricted to the broker host:
 
-**`env_id` is the only credential.** It is 256 bits from `secrets.token_urlsafe`
-and lives exclusively in the broker's SQLite database. The workflow is
-dispatched with nothing but a random hostname, a TTL and a profile name, so it
-does not matter that workflow inputs are world-readable on a public repository.
-Every tool call must carry `env_id`; it is a required parameter rather than a
-string prefix, so it cannot be forgotten or mangled by quoting.
+```json
+"ssh": [{
+  "action": "accept",
+  "src":    ["tag:broker"],
+  "dst":    ["tag:gha-env"],
+  "users":  ["runner"]
+}]
+```
+
+Note that the broker runs in a container on a bridge network, so its traffic
+is NATed to the *host's* tailnet identity — write the rule against the broker
+host, not the container. Do not set `checkPeriod`: check mode requires a
+browser interaction and will hang a non-interactive connection.
+
+**No TLS on the tailnet leg.** SSH inside WireGuard is already two layers.
+Host-key checking is disabled because the runner is created fresh every time
+and its key is therefore new every time; the tailnet is the trust anchor.
+
+**`env_id` is the only credential clients hold.** It is 256 bits from
+`secrets.token_urlsafe` and lives exclusively in the broker's SQLite database.
+The workflow is dispatched with nothing but a random hostname, a TTL and a
+profile name, so it does not matter that workflow inputs are world-readable on
+a public repository.
 
 **Ephemeral Tailscale nodes.** Devices deregister themselves when the job ends,
 so there is no cleanup step that could delete a sibling environment by mistake.
@@ -42,8 +56,8 @@ so there is no cleanup step that could delete a sibling environment by mistake.
 ### 1. Tailscale auth key
 
 Create a key at <https://login.tailscale.com/admin/settings/keys> with
-**Ephemeral**, **Reusable** and **Pre-approved** enabled (tag it if your ACLs
-require one), and store it as the repository secret `TS_AUTHKEY`.
+**Ephemeral**, **Reusable** and **Pre-approved** enabled, tagged `tag:gha-env`
+if you use the ACL above, and store it as the repository secret `TS_AUTHKEY`.
 
 ### 2. GitHub token
 
@@ -83,7 +97,7 @@ tailscale funnel --bg --https=443 http://127.0.0.1:8080
 
 This is the one and only public entry point. Connect Notion to
 `https://<broker-host>.<tailnet>.ts.net/mcp` with the `BROKER_TOKEN` as a
-bearer token.
+bearer token, and list that same hostname in `BROKER_PUBLIC_HOSTS`.
 
 ## Tools
 
@@ -97,28 +111,29 @@ bearer token.
 | `destroy_env(env_id)` | Stop the runner and free capacity. |
 | `list_envs()` | Live environments, with `env_id` masked. |
 
-Profiles: `base` (SSH only) or `playwright` (also starts a Playwright MCP
-server on port 8931).
+Profiles: `base` (shell only) or `playwright` (also starts a Playwright MCP
+server on port 8931, published on the tailnet with `tailscale serve`).
 
 ## Operational notes
 
-- Each `exec` opens its own SSH channel, so calls run genuinely in parallel.
-  Working directory and shell variables do **not** persist between calls —
-  chain with `cd /path && ...`.
-- ssh-mcp is started with `--timeout=600000`. Its default of 60 s makes it kill
-  the remote process with `pkill -f`, which can match unrelated commands.
-  For anything long, detach: `nohup ... > /tmp/job.log 2>&1 &`.
-- `sshd` is configured with `MaxSessions 50`, since the default of 10 caps how
-  many tool calls can run at once over the single SSH connection.
+- The broker keeps one SSH connection per environment and opens a fresh
+  channel per command, so calls run genuinely in parallel. Working directory
+  and shell variables do **not** persist between calls — chain with
+  `cd /path && ...`.
+- On timeout the broker closes that channel only. Nothing is `pkill`ed, so
+  unrelated processes are never caught in the blast radius. For anything long,
+  detach anyway: `nohup ... > /tmp/job.log 2>&1 &`.
+- A dead pooled connection is retried once transparently.
 - Jobs are hard-stopped by GitHub after 6 hours regardless of TTL.
-- A watchdog restarts the MCP servers if they crash mid-session; logs are
-  uploaded as a run artifact.
 
 ### Troubleshooting
 
 | Symptom | Likely cause |
 | --- | --- |
+| `421 Misdirected Request` | `BROKER_PUBLIC_HOSTS` does not list the hostname the client uses |
+| `401 unauthorized` from the broker | `BROKER_TOKEN` mismatch between `.env` and the MCP client |
+| `ssh to ... failed: Permission denied` | Tailscale ACL does not grant `ssh` from the broker host to the environment, or `users` omits `runner` |
+| `ssh to ... failed` hangs then times out | ACL uses check mode (`checkPeriod`), which cannot work non-interactively |
 | `create_env` works, `wait_ready` never turns ready | The container cannot resolve MagicDNS. `docker compose exec broker python -c "import socket;print(socket.gethostbyname('<host>'))"` |
 | Name resolution fails but `100.x` IPs ping | `dns:` is not taking effect, or tailscaled is in userspace mode on this host |
 | `workflow_dispatch failed: 404` | The PAT lacks Actions write, or `ephemeral-env.yml` is not on the default branch |
-| `401 unauthorized` from the broker | `BROKER_TOKEN` mismatch between `.env` and the MCP client |

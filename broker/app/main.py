@@ -4,17 +4,19 @@ The broker is the only component exposed to the internet. It:
 
   1. mints a high-entropy ``env_id`` per conversation/session,
   2. dispatches ``ephemeral-env.yml`` with a random hostname,
-  3. proxies ``exec`` / ``sudo_exec`` to the environment that owns that
-     ``env_id`` over the tailnet.
+  3. runs commands on the environment that owns that ``env_id`` over
+     Tailscale SSH.
 
 Design notes
 ------------
 * ``env_id`` is a capability and never leaves the broker. The workflow only
   receives the hostname, which is meaningless outside the tailnet, so a
   public repository leaking its workflow inputs leaks nothing useful.
-* Environments are published with ``tailscale serve`` over plain HTTP. The
-  hop is already encrypted by WireGuard; adding TLS there would only buy a
-  Let's Encrypt dependency and its per-tailnet rate limits.
+* Commands travel over plain SSH inside WireGuard. Tailscale SSH terminates
+  the connection inside tailscaled on the runner, which means the caller is
+  authenticated by its tailnet identity and can be restricted with an ACL.
+  An earlier revision proxied MCP to an ssh-mcp instance listening on the
+  tailnet with no authentication at all; this replaces that.
 * Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table.
 """
 
@@ -23,14 +25,14 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+import shlex
 import sqlite3
 import string
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import asyncssh
 import httpx
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -52,11 +54,17 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "windows")
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "ephemeral-env.yml")
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
-ENV_MCP_PORT = int(os.environ.get("ENV_MCP_PORT", "8932"))
 MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
+
+# Tailscale SSH: the runner's unprivileged account, port 22 handled by
+# tailscaled itself. Authentication is the tailnet identity of this host, so
+# there is no key to distribute.
+SSH_USER = os.environ.get("SSH_USER", "runner")
+SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+SSH_CONNECT_TIMEOUT = int(os.environ.get("SSH_CONNECT_TIMEOUT", "20"))
 
 # Hostnames clients may use to reach this broker, comma separated, without a
 # scheme (e.g. "broker.tail1234.ts.net"). See build_transport_security().
@@ -69,6 +77,14 @@ PUBLIC_HOSTS = [
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
+
+
+class ExecTimeout(RuntimeError):
+    """A command exceeded its timeout.
+
+    Deliberately not an OSError: builtin TimeoutError is one, and the retry
+    path below must not treat a slow command as a broken connection.
+    """
 
 
 def now() -> datetime:
@@ -186,12 +202,8 @@ def host_for(host_id: str) -> str:
     return "gha-env-" + host_id + "." + TAILNET_DOMAIN
 
 
-def mcp_url(host: str) -> str:
-    return "http://" + host + ":" + str(ENV_MCP_PORT) + "/mcp"
-
-
 # --------------------------------------------------------------------------
-# github + upstream MCP
+# github
 # --------------------------------------------------------------------------
 
 
@@ -233,36 +245,98 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
         )
 
 
-async def upstream_call(
-    host: str, tool: str, arguments: dict[str, Any], timeout: int = 180
+# --------------------------------------------------------------------------
+# SSH transport
+# --------------------------------------------------------------------------
+
+# One connection per environment, reused across calls. Every exec opens its
+# own channel on it, so calls still run in parallel; this only avoids paying
+# the handshake on each command.
+_conns: dict[str, asyncssh.SSHClientConnection] = {}
+_conn_lock = asyncio.Lock()
+
+
+async def open_conn(host: str) -> asyncssh.SSHClientConnection:
+    # client_keys=[] disables public-key auth so asyncssh falls through to the
+    # "none" method, which is what Tailscale SSH accepts once its ACL has
+    # authorised this node. known_hosts is off because the runner's key is
+    # generated fresh on every boot; the tailnet is the trust anchor here.
+    return await asyncssh.connect(
+        host,
+        port=SSH_PORT,
+        username=SSH_USER,
+        known_hosts=None,
+        client_keys=[],
+        config=None,
+        connect_timeout=SSH_CONNECT_TIMEOUT,
+    )
+
+
+async def get_conn(host: str) -> asyncssh.SSHClientConnection:
+    async with _conn_lock:
+        conn = _conns.get(host)
+        if conn is not None and not conn.is_closed():
+            return conn
+        conn = await open_conn(host)
+        _conns[host] = conn
+        return conn
+
+
+def drop_conn(host: str) -> None:
+    conn = _conns.pop(host, None)
+    if conn is not None:
+        try:
+            conn.abort()
+        except Exception:
+            pass
+
+
+def wrap(command: str, sudo: bool) -> str:
+    inner = "bash -lc " + shlex.quote(command)
+    return "sudo -n " + inner if sudo else inner
+
+
+async def ssh_run(
+    host: str, command: str, timeout: int = 180, sudo: bool = False
 ) -> str:
-    """Call a tool on the environment's ssh-mcp (via mcp-proxy)."""
-    async with streamablehttp_client(
-        mcp_url(host),
-        timeout=timedelta(seconds=timeout),
-        sse_read_timeout=timedelta(seconds=timeout + 60),
-    ) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool, arguments)
-            chunks = [
-                getattr(part, "text", "")
-                for part in result.content
-                if getattr(part, "type", "") == "text"
-            ]
-            return "\n".join(c for c in chunks if c)
+    """Run one command in its own SSH channel and return its combined output."""
+    line = wrap(command, sudo)
+    last: Exception | None = None
+    # A pooled connection may have died with the runner in between calls;
+    # one silent reconnect is worth more than surfacing that to the caller.
+    for attempt in (1, 2):
+        try:
+            conn = await get_conn(host)
+            async with conn.create_process(line) as proc:
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    proc.terminate()
+                    raise ExecTimeout(
+                        "command timed out after "
+                        + str(timeout)
+                        + "s and was terminated; for long jobs detach with "
+                        "`nohup ... > /tmp/job.log 2>&1 &` and poll the log"
+                    )
+                status = proc.exit_status
+            out = (stdout or "") + (stderr or "")
+            if status:
+                out = out + "\n[exit status " + str(status) + "]"
+            return out.strip()
+        except (OSError, asyncssh.Error) as exc:
+            last = exc
+            drop_conn(host)
+    raise RuntimeError("ssh to " + host + " failed: " + str(last))
 
 
 async def probe(host: str, timeout: int = 15) -> bool:
     try:
-        async with streamablehttp_client(
-            mcp_url(host), timeout=timedelta(seconds=timeout)
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                await session.list_tools()
+        await ssh_run(host, "true", timeout=timeout)
         return True
     except Exception:
+        drop_conn(host)
         return False
 
 
@@ -313,7 +387,7 @@ async def create_env(
     Returns immediately with state=provisioning; boot takes a few minutes.
     Poll wait_ready or env_status before running commands.
 
-    profile: "base" (SSH only) or "playwright" (adds a Playwright MCP server).
+    profile: "base" (shell only) or "playwright" (adds a Playwright MCP server).
     """
     if profile not in ("base", "playwright"):
         raise ValueError("profile must be 'base' or 'playwright'")
@@ -391,10 +465,9 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     `nohup ... > /tmp/job.log 2>&1 &` and poll the log.
     """
     row = await resolve(env_id)
-    return await upstream_call(
+    return await ssh_run(
         host_for(row["host_id"]),
-        "exec",
-        {"command": command},
+        command,
         timeout=max(10, min(int(timeout_seconds), 600)),
     )
 
@@ -403,11 +476,11 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
 async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """Run a shell command as root inside the environment identified by env_id."""
     row = await resolve(env_id)
-    return await upstream_call(
+    return await ssh_run(
         host_for(row["host_id"]),
-        "sudo-exec",
-        {"command": command},
+        command,
         timeout=max(10, min(int(timeout_seconds), 600)),
+        sudo=True,
     )
 
 
@@ -415,18 +488,15 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
 async def destroy_env(env_id: str) -> dict[str, Any]:
     """Shut the environment down now and free up capacity."""
     row = await resolve(env_id)
+    host = host_for(row["host_id"])
     stopped = False
     try:
         # The workflow's keep-alive loop watches for this file.
-        await upstream_call(
-            host_for(row["host_id"]),
-            "exec",
-            {"command": "touch /tmp/stop.txt"},
-            timeout=30,
-        )
+        await ssh_run(host, "touch /tmp/stop.txt", timeout=30)
         stopped = True
     except Exception:
         pass
+    drop_conn(host)
     set_state(env_id, "destroyed")
     return {
         "state": "destroyed",
