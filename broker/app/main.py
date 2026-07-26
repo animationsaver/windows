@@ -150,10 +150,19 @@ DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
 #                    notifications and no server-initiated requests, so the
 #                    stream carried exactly one message anyway.
 #   STATELESS=1      no Mcp-Session-Id; each request stands alone.
-# Both are here rather than hardcoded because which combination a given client
-# tolerates is only discoverable empirically.
+#   GET_STREAM=0     GET /mcp is refused with 405 rather than answered with a
+#                    server->client stream. In stateless mode the SDK opens
+#                    that stream and tears it down again a moment later, and a
+#                    client that expects it to stay open cannot distinguish
+#                    that from the connection dropping: it abandons the
+#                    handshake before ever sending tools/list. The spec lets a
+#                    server that never pushes answer 405, which clients handle
+#                    by simply not asking again.
+# These are configurable rather than hardcoded because which combination a
+# given client tolerates is only discoverable empirically.
 JSON_RESPONSE = env_flag("BROKER_JSON_RESPONSE", True)
 STATELESS = env_flag("BROKER_STATELESS", True)
+GET_STREAM = env_flag("BROKER_GET_STREAM", False)
 
 # Tailscale SSH: the runner's unprivileged account, port 22 handled by
 # tailscaled itself. Authentication is the tailnet identity of this host, so
@@ -870,6 +879,31 @@ class RequestLog(BaseHTTPMiddleware):
         return receive
 
 
+class NoStandaloneStream(BaseHTTPMiddleware):
+    """Refuse GET /mcp unless the server->client stream is wanted.
+
+    This broker only ever answers requests, so the standalone stream carries
+    nothing. Worse, in stateless mode the SDK closes it again immediately,
+    which a client cannot tell apart from the connection failing underneath
+    it. 405 is what the streamable-http spec prescribes for a server that does
+    not offer the stream at all, and clients treat it as a fact about the
+    server rather than as an error.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if (
+            not GET_STREAM
+            and request.method == "GET"
+            and request.url.path.startswith("/mcp")
+        ):
+            return JSONResponse(
+                {"error": "this server does not offer a server-to-client stream"},
+                status_code=405,
+                headers={"Allow": "POST"},
+            )
+        return await call_next(request)
+
+
 class BearerAuth(BaseHTTPMiddleware):
     """Single shared token in front of the MCP endpoint.
 
@@ -903,11 +937,15 @@ except TypeError:
     app = mcp.streamable_http_app()
 
 app.router.routes.append(Route("/healthz", healthz, methods=["GET"]))
+# Last added is outermost, so requests pass RequestLog -> NoStandaloneStream
+# -> BearerAuth -> the MCP app.
 app.add_middleware(BearerAuth)
+app.add_middleware(NoStandaloneStream)
 app.add_middleware(RequestLog)
 
 log.info(
-    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log=%s json_response=%s stateless=%s",
+    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log=%s json_response=%s "
+    "stateless=%s get_stream=%s",
     GITHUB_OWNER,
     GITHUB_REPO,
     TAILNET_DOMAIN,
@@ -915,4 +953,5 @@ log.info(
     LOG_LEVEL,
     JSON_RESPONSE,
     STATELESS,
+    GET_STREAM,
 )
