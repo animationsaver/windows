@@ -54,6 +54,14 @@ try:  # available since mcp 1.9.x
 except ImportError:  # pragma: no cover - older SDKs have no Host validation
     TransportSecuritySettings = None  # type: ignore[assignment]
 
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # --------------------------------------------------------------------------
 # logging
 # --------------------------------------------------------------------------
@@ -78,8 +86,7 @@ logging.getLogger("asyncssh").setLevel(
 
 def short(value: Any) -> str:
     """Render a tool argument for the log without leaking a credential."""
-    text = str(value)
-    return text[:200]
+    return str(value)[:200]
 
 
 def traced(fn):
@@ -131,6 +138,17 @@ MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
+
+# Transport shape. Defaults chosen for the simplest possible client:
+#   JSON_RESPONSE=1  POST /mcp answers with one application/json body rather
+#                    than an SSE-framed stream. We have no progress
+#                    notifications and no server-initiated requests, so the
+#                    stream carried exactly one message anyway.
+#   STATELESS=1      no Mcp-Session-Id; each request stands alone.
+# Both are here rather than hardcoded because which combination a given client
+# tolerates is only discoverable empirically.
+JSON_RESPONSE = env_flag("BROKER_JSON_RESPONSE", True)
+STATELESS = env_flag("BROKER_STATELESS", True)
 
 # Tailscale SSH: the runner's unprivileged account, port 22 handled by
 # tailscaled itself. Authentication is the tailnet identity of this host, so
@@ -553,7 +571,8 @@ MCP_KWARGS: dict[str, Any] = {
         "available Playwright tools and their arguments, and browser_call to "
         "invoke them. Everything runs through this one server."
     ),
-    "stateless_http": True,
+    "stateless_http": STATELESS,
+    "json_response": JSON_RESPONSE,
     "streamable_http_path": "/mcp",
 }
 
@@ -797,7 +816,7 @@ class RequestLog(BaseHTTPMiddleware):
         started = time.monotonic()
         response = await call_next(request)
         log.info(
-            '%s %s -> %s (%.2fs) host=%s',
+            "%s %s -> %s (%.2fs) host=%s",
             request.method,
             request.url.path,
             response.status_code,
@@ -844,10 +863,12 @@ app.add_middleware(BearerAuth)
 app.add_middleware(RequestLog)
 
 log.info(
-    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log_level=%s",
+    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log=%s json_response=%s stateless=%s",
     GITHUB_OWNER,
     GITHUB_REPO,
     TAILNET_DOMAIN,
     MAX_ENVS,
     LOG_LEVEL,
+    JSON_RESPONSE,
+    STATELESS,
 )
