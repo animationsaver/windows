@@ -51,7 +51,8 @@ A fine-grained PAT limited to this repository with **Actions: Read and write**.
 
 ### 3. Run the broker
 
-On a host that has already joined your tailnet:
+On a host that has already joined your tailnet **in kernel mode** (verify with
+`ip a | grep tailscale0`):
 
 ```bash
 cd broker
@@ -60,13 +61,19 @@ docker compose up -d          # pulls ghcr.io/animationsaver/windows/broker
 curl localhost:8080/healthz
 ```
 
-The image is built and published by
-`.github/workflows/broker-image.yml` (linux/amd64 + linux/arm64), so nothing is
-compiled on the broker host. Update with `docker compose pull && docker compose
-up -d`, or build locally with `docker compose up -d --build`.
+The image is built and published by `.github/workflows/broker-image.yml`
+(linux/amd64 + linux/arm64), so nothing is compiled on the broker host. Update
+with `docker compose pull && docker compose up -d`, or build locally with
+`docker compose up -d --build`.
 
-The container uses `network_mode: host` so it can resolve MagicDNS names
-through the host's tailscaled.
+The container runs on a normal bridge network and is published on
+`127.0.0.1:8080` only. Routing to the tailnet works through the host; the one
+thing that needs pinning is DNS, because Docker discards the loopback
+nameserver that systemd-resolved advertises MagicDNS on. The compose file
+therefore points the container at Tailscale's resolver (`100.100.100.100`)
+directly. If your broker host runs tailscaled with
+`--tun=userspace-networking`, that resolver does not exist and you will need
+`network_mode: host` instead.
 
 ### 4. Expose the broker
 
@@ -106,3 +113,12 @@ server on port 8931).
 - Jobs are hard-stopped by GitHub after 6 hours regardless of TTL.
 - A watchdog restarts the MCP servers if they crash mid-session; logs are
   uploaded as a run artifact.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| `create_env` works, `wait_ready` never turns ready | The container cannot resolve MagicDNS. `docker compose exec broker python -c "import socket;print(socket.gethostbyname('<host>'))"` |
+| Name resolution fails but `100.x` IPs ping | `dns:` is not taking effect, or tailscaled is in userspace mode on this host |
+| `workflow_dispatch failed: 404` | The PAT lacks Actions write, or `ephemeral-env.yml` is not on the default branch |
+| `401 unauthorized` from the broker | `BROKER_TOKEN` mismatch between `.env` and the MCP client |

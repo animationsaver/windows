@@ -11,25 +11,30 @@ services:
     container_name: gha-env-broker
     restart: unless-stopped
     env_file: .env
-    # Host networking, so:
-    #   * outbound: the container can reach the tailnet (100.64.0.0/10) and
-    #     resolve MagicDNS names through the host's tailscaled;
-    #   * inbound: there is nothing to publish. The container shares the
-    #     host's network namespace, so the port below IS the host's port.
-    #     A `ports:` mapping would be ignored here.
-    network_mode: host
-    # Loopback only. The sole public entry point is
+
+    # Loopback only. The single public entry point is
     #   tailscale funnel --bg --https=443 http://127.0.0.1:8080
-    # which proxies from the host itself, so the broker never needs to be
-    # bound to a LAN or public interface. Change to 0.0.0.0 only if you
-    # deliberately want to reach it from your LAN.
-    command:
-      - uvicorn
-      - app.main:app
-      - --host
-      - 127.0.0.1
-      - --port
-      - "8080"
+    # which proxies from the host itself. Drop the 127.0.0.1 prefix only if
+    # you deliberately want to reach the broker from your LAN.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Reaching the tailnet (100.64.0.0/10) already works from a bridge
+    # network: the container's default route points at the host, which has a
+    # route via tailscale0 and masquerades the traffic. Only *resolution*
+    # needs help -- Docker discards loopback nameservers, so the
+    # 127.0.0.53 stub that systemd-resolved advertises MagicDNS on never
+    # reaches the container. Point at Tailscale's resolver directly instead.
+    #
+    # Requires tailscaled on this host to run in kernel mode (check with
+    # `ip a | grep tailscale0`); under --tun=userspace-networking there is no
+    # 100.100.100.100 to talk to, and you would need network_mode: host.
+    dns:
+      - 100.100.100.100
+    dns_search:
+      # Lets the broker resolve bare hostnames too. Interpolated from .env.
+      - ${TAILNET_DOMAIN:?set TAILNET_DOMAIN in broker/.env}
+
     volumes:
       - broker-data:/data
     healthcheck:
