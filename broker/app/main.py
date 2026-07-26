@@ -37,6 +37,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
+try:  # available since mcp 1.9.x
+    from mcp.server.transport_security import TransportSecuritySettings
+except ImportError:  # pragma: no cover - older SDKs have no Host validation
+    TransportSecuritySettings = None  # type: ignore[assignment]
+
 # --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
@@ -53,6 +58,14 @@ DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
 
+# Hostnames clients may use to reach this broker, comma separated, without a
+# scheme (e.g. "broker.tail1234.ts.net"). See build_transport_security().
+PUBLIC_HOSTS = [
+    h.strip()
+    for h in os.environ.get("BROKER_PUBLIC_HOSTS", "").split(",")
+    if h.strip()
+]
+
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
@@ -64,6 +77,37 @@ def now() -> datetime:
 
 def iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat()
+
+
+def build_transport_security():
+    """Configure the SDK's DNS-rebinding protection.
+
+    FastMCP defaults to host 127.0.0.1, and in that case ``streamable_http_app``
+    switches Host/Origin validation on with only local addresses allowed. Every
+    request forwarded by ``tailscale funnel`` carries the public ts.net Host
+    header, so without this the middleware answers 421 Misdirected Request
+    before any tool runs.
+
+    With no BROKER_PUBLIC_HOSTS set we turn the check off instead of guessing:
+    the bearer token is what actually guards this server, and DNS rebinding is
+    a browser attack that does not apply to a server-side MCP client.
+    """
+    if TransportSecuritySettings is None:
+        return None
+    if not PUBLIC_HOSTS:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    allowed_hosts = ["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"]
+    allowed_origins: list[str] = []
+    for host in PUBLIC_HOSTS:
+        allowed_hosts += [host, host + ":*"]
+        allowed_origins += ["https://" + host, "https://" + host + ":*"]
+    return TransportSecuritySettings(
+        allowed_hosts=allowed_hosts, allowed_origins=allowed_origins
+    )
+
+
+SECURITY = build_transport_security()
 
 
 # --------------------------------------------------------------------------
@@ -239,16 +283,23 @@ async def resolve(env_id: str) -> sqlite3.Row:
 # MCP surface
 # --------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="gha-env-broker",
-    instructions=(
+MCP_KWARGS: dict[str, Any] = {
+    "name": "gha-env-broker",
+    "instructions": (
         "Disposable Linux environments backed by GitHub Actions runners.\n"
         "Call create_env once per conversation, keep the returned env_id, and "
         "pass it to every exec call. Environments are wiped when they expire."
     ),
-    stateless_http=True,
-    streamable_http_path="/mcp",
-)
+    "stateless_http": True,
+    "streamable_http_path": "/mcp",
+}
+
+# Depending on the SDK version, transport security is accepted by the
+# constructor, by streamable_http_app(), or not at all.
+try:
+    mcp = FastMCP(transport_security=SECURITY, **MCP_KWARGS)
+except TypeError:
+    mcp = FastMCP(**MCP_KWARGS)
 
 
 @mcp.tool()
@@ -436,6 +487,10 @@ async def healthz(_: Request) -> PlainTextResponse:
 
 init_db()
 
-app = mcp.streamable_http_app()
+try:
+    app = mcp.streamable_http_app(transport_security=SECURITY)
+except TypeError:
+    app = mcp.streamable_http_app()
+
 app.router.routes.append(Route("/healthz", healthz, methods=["GET"]))
 app.add_middleware(BearerAuth)
