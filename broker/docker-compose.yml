@@ -11,9 +11,25 @@ services:
     container_name: gha-env-broker
     restart: unless-stopped
     env_file: .env
-    # Host networking so the container can reach the tailnet (100.64.0.0/10)
-    # and resolve MagicDNS names through the host's tailscaled.
+    # Host networking, so:
+    #   * outbound: the container can reach the tailnet (100.64.0.0/10) and
+    #     resolve MagicDNS names through the host's tailscaled;
+    #   * inbound: there is nothing to publish. The container shares the
+    #     host's network namespace, so the port below IS the host's port.
+    #     A `ports:` mapping would be ignored here.
     network_mode: host
+    # Loopback only. The sole public entry point is
+    #   tailscale funnel --bg --https=443 http://127.0.0.1:8080
+    # which proxies from the host itself, so the broker never needs to be
+    # bound to a LAN or public interface. Change to 0.0.0.0 only if you
+    # deliberately want to reach it from your LAN.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8080"
     volumes:
       - broker-data:/data
     healthcheck:
