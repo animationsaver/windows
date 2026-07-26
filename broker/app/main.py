@@ -28,11 +28,14 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import functools
+import logging
 import os
 import secrets
 import shlex
 import sqlite3
 import string
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -50,6 +53,69 @@ try:  # available since mcp 1.9.x
     from mcp.server.transport_security import TransportSecuritySettings
 except ImportError:  # pragma: no cover - older SDKs have no Host validation
     TransportSecuritySettings = None  # type: ignore[assignment]
+
+# --------------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------------
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# force=True: uvicorn configures the root logger before importing this module,
+# so without it basicConfig is a no-op and nothing below ever prints.
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    force=True,
+)
+log = logging.getLogger("broker")
+
+# asyncssh is quiet by default and it is the component most likely to be at
+# fault (ACLs, auth, DNS). At DEBUG it explains exactly why a connection died.
+logging.getLogger("asyncssh").setLevel(
+    logging.DEBUG if LOG_LEVEL == "DEBUG" else logging.WARNING
+)
+
+
+def short(value: Any) -> str:
+    """Render a tool argument for the log without leaking a credential."""
+    text = str(value)
+    return text[:200]
+
+
+def traced(fn):
+    """Log entry, duration and failures of an MCP tool.
+
+    FastMCP converts an exception into a JSON-RPC error for the client and
+    swallows it otherwise, so without this a broken tool leaves no trace in
+    `docker compose logs` at all.
+
+    functools.wraps keeps __wrapped__ and __annotations__ intact, which is what
+    FastMCP introspects to build the tool schema.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        shown = {
+            k: (short(v)[:6] + "..." if k == "env_id" else short(v))
+            for k, v in kwargs.items()
+        }
+        log.info("call %s %s", fn.__name__, shown)
+        started = time.monotonic()
+        try:
+            result = await fn(*args, **kwargs)
+        except Exception as exc:
+            log.exception(
+                "%s failed after %.1fs: %s",
+                fn.__name__,
+                time.monotonic() - started,
+                exc,
+            )
+            raise
+        log.info("done %s in %.1fs", fn.__name__, time.monotonic() - started)
+        return result
+
+    return wrapper
+
 
 # --------------------------------------------------------------------------
 # configuration
@@ -120,8 +186,13 @@ def build_transport_security():
     a browser attack that does not apply to a server-side MCP client.
     """
     if TransportSecuritySettings is None:
+        log.warning("mcp SDK has no transport_security module; Host check off")
         return None
     if not PUBLIC_HOSTS:
+        log.warning(
+            "BROKER_PUBLIC_HOSTS is empty: Host validation disabled, only the "
+            "bearer token guards this server"
+        )
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
     allowed_hosts = ["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"]
@@ -129,6 +200,7 @@ def build_transport_security():
     for host in PUBLIC_HOSTS:
         allowed_hosts += [host, host + ":*"]
         allowed_origins += ["https://" + host, "https://" + host + ":*"]
+    log.info("allowed Host headers: %s", allowed_hosts)
     return TransportSecuritySettings(
         allowed_hosts=allowed_hosts, allowed_origins=allowed_origins
     )
@@ -245,6 +317,7 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    log.info("dispatching %s for gha-env-%s (%s)", WORKFLOW_FILE, host_id, profile)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code not in (202, 204):
@@ -275,7 +348,8 @@ async def open_conn(host: str) -> asyncssh.SSHClientConnection:
     # "none" method, which is what Tailscale SSH accepts once its ACL has
     # authorised this node. known_hosts is off because the runner's key is
     # generated fresh on every boot; the tailnet is the trust anchor here.
-    return await asyncssh.connect(
+    log.debug("ssh connect %s@%s:%s", SSH_USER, host, SSH_PORT)
+    conn = await asyncssh.connect(
         host,
         port=SSH_PORT,
         username=SSH_USER,
@@ -284,6 +358,8 @@ async def open_conn(host: str) -> asyncssh.SSHClientConnection:
         config=None,
         connect_timeout=SSH_CONNECT_TIMEOUT,
     )
+    log.info("ssh connected to %s", host)
+    return conn
 
 
 async def get_conn(host: str) -> asyncssh.SSHClientConnection:
@@ -305,6 +381,7 @@ def drop_conn(host: str) -> None:
             pass
     conn = _conns.pop(host, None)
     if conn is not None:
+        log.debug("dropping ssh connection to %s", host)
         try:
             conn.abort()
         except Exception:
@@ -346,16 +423,26 @@ async def ssh_run(
                 out = out + "\n[exit status " + str(status) + "]"
             return out.strip()
         except (OSError, asyncssh.Error) as exc:
+            log.warning(
+                "ssh attempt %s/2 to %s failed: %s: %s",
+                attempt,
+                host,
+                type(exc).__name__,
+                exc,
+            )
             last = exc
             drop_conn(host)
-    raise RuntimeError("ssh to " + host + " failed: " + str(last))
+    raise RuntimeError(
+        "ssh to " + host + " failed: " + type(last).__name__ + ": " + str(last)
+    )
 
 
 async def probe(host: str, timeout: int = 15) -> bool:
     try:
         await ssh_run(host, "true", timeout=timeout)
         return True
-    except Exception:
+    except Exception as exc:
+        log.info("probe of %s not ready yet: %s", host, exc)
         drop_conn(host)
         return False
 
@@ -394,6 +481,9 @@ async def pw_endpoint(host: str) -> str:
             "127.0.0.1", 0, "127.0.0.1", PW_MCP_PORT
         )
         port = listener.get_port()
+        log.info(
+            "tunnel 127.0.0.1:%s -> %s:127.0.0.1:%s", port, host, PW_MCP_PORT
+        )
         _tunnels[host] = (conn, listener, port)
         return "http://127.0.0.1:" + str(port) + "/mcp"
 
@@ -419,6 +509,13 @@ async def pw_request(host: str, action, timeout: int):
                     await session.initialize()
                     return await action(session)
         except (OSError, asyncssh.Error) as exc:
+            log.warning(
+                "playwright attempt %s/2 on %s failed: %s: %s",
+                attempt,
+                host,
+                type(exc).__name__,
+                exc,
+            )
             last = exc
             drop_conn(host)
     raise RuntimeError(
@@ -469,6 +566,7 @@ except TypeError:
 
 
 @mcp.tool()
+@traced
 async def create_env(
     ttl_minutes: int = DEFAULT_TTL,
     profile: str = "base",
@@ -525,6 +623,7 @@ async def create_env(
 
 
 @mcp.tool()
+@traced
 async def env_status(env_id: str) -> dict[str, Any]:
     """Report whether the environment is still provisioning or ready to use."""
     row = await resolve(env_id)
@@ -538,6 +637,7 @@ async def env_status(env_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@traced
 async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]:
     """Block until the environment answers, or until max_wait_seconds passes.
 
@@ -555,6 +655,7 @@ async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]
 
 
 @mcp.tool()
+@traced
 async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """Run a shell command inside the environment identified by env_id.
 
@@ -572,6 +673,7 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
 
 
 @mcp.tool()
+@traced
 async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """Run a shell command as root inside the environment identified by env_id."""
     row = await resolve(env_id)
@@ -584,6 +686,7 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
 
 
 @mcp.tool()
+@traced
 async def browser_tools(env_id: str) -> list[dict[str, Any]]:
     """List the Playwright tools available in this environment.
 
@@ -608,6 +711,7 @@ async def browser_tools(env_id: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+@traced
 async def browser_call(
     env_id: str,
     tool: str,
@@ -635,6 +739,7 @@ async def browser_call(
 
 
 @mcp.tool()
+@traced
 async def destroy_env(env_id: str) -> dict[str, Any]:
     """Shut the environment down now and free up capacity."""
     row = await resolve(env_id)
@@ -644,8 +749,8 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
         # The workflow's keep-alive loop watches for this file.
         await ssh_run(host, "touch /tmp/stop.txt", timeout=30)
         stopped = True
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("graceful stop of %s failed: %s", host, exc)
     drop_conn(host)
     set_state(env_id, "destroyed")
     return {
@@ -657,6 +762,7 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@traced
 async def list_envs() -> list[dict[str, Any]]:
     """List live environments (env_ids are masked; only the owner has them)."""
     reap()
@@ -684,6 +790,23 @@ async def list_envs() -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 
+class RequestLog(BaseHTTPMiddleware):
+    """One line per request, so failures that never reach a tool are visible."""
+
+    async def dispatch(self, request: Request, call_next):
+        started = time.monotonic()
+        response = await call_next(request)
+        log.info(
+            '%s %s -> %s (%.2fs) host=%s',
+            request.method,
+            request.url.path,
+            response.status_code,
+            time.monotonic() - started,
+            request.headers.get("host", "-"),
+        )
+        return response
+
+
 class BearerAuth(BaseHTTPMiddleware):
     """Single shared token in front of the MCP endpoint.
 
@@ -696,6 +819,10 @@ class BearerAuth(BaseHTTPMiddleware):
             header = request.headers.get("authorization", "")
             token = header[7:] if header.lower().startswith("bearer ") else ""
             if not secrets.compare_digest(token, BROKER_TOKEN):
+                log.warning(
+                    "rejected unauthorised request from %s",
+                    request.client.host if request.client else "?",
+                )
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
@@ -714,3 +841,13 @@ except TypeError:
 
 app.router.routes.append(Route("/healthz", healthz, methods=["GET"]))
 app.add_middleware(BearerAuth)
+app.add_middleware(RequestLog)
+
+log.info(
+    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log_level=%s",
+    GITHUB_OWNER,
+    GITHUB_REPO,
+    TAILNET_DOMAIN,
+    MAX_ENVS,
+    LOG_LEVEL,
+)
