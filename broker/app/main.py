@@ -1,22 +1,27 @@
 """MCP broker for disposable GitHub Actions environments.
 
-The broker is the only component exposed to the internet. It:
+The broker is the only component exposed to the internet, and the only MCP
+endpoint a client ever connects to. It:
 
   1. mints a high-entropy ``env_id`` per conversation/session,
   2. dispatches ``ephemeral-env.yml`` with a random hostname,
   3. runs commands on the environment that owns that ``env_id`` over
-     Tailscale SSH.
+     Tailscale SSH,
+  4. re-exposes the environment's Playwright MCP server through an SSH port
+     forward, so the browser lives behind the same endpoint, the same bearer
+     token and the same ``env_id`` as the shell.
 
 Design notes
 ------------
 * ``env_id`` is a capability and never leaves the broker. The workflow only
   receives the hostname, which is meaningless outside the tailnet, so a
   public repository leaking its workflow inputs leaks nothing useful.
-* Commands travel over plain SSH inside WireGuard. Tailscale SSH terminates
-  the connection inside tailscaled on the runner, which means the caller is
-  authenticated by its tailnet identity and can be restricted with an ACL.
-  An earlier revision proxied MCP to an ssh-mcp instance listening on the
-  tailnet with no authentication at all; this replaces that.
+* The environment listens on nothing at all on the tailnet. Tailscale SSH is
+  terminated inside tailscaled, so the caller is authenticated by its tailnet
+  identity and can be restricted with an ACL. An earlier revision proxied MCP
+  to servers listening on the tailnet with no authentication whatsoever.
+* Playwright is proxied generically (list + call) rather than mirrored tool by
+  tool, so a new playwright-mcp release does not require a broker release.
 * Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table.
 """
 
@@ -33,6 +38,8 @@ from typing import Any
 
 import asyncssh
 import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -65,6 +72,10 @@ DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
 SSH_USER = os.environ.get("SSH_USER", "runner")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 SSH_CONNECT_TIMEOUT = int(os.environ.get("SSH_CONNECT_TIMEOUT", "20"))
+
+# Loopback port Playwright MCP binds on the runner. Never published; reached
+# only through the SSH forward set up below.
+PW_MCP_PORT = int(os.environ.get("PW_MCP_PORT", "8931"))
 
 # Hostnames clients may use to reach this broker, comma separated, without a
 # scheme (e.g. "broker.tail1234.ts.net"). See build_transport_security().
@@ -251,9 +262,12 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
 
 # One connection per environment, reused across calls. Every exec opens its
 # own channel on it, so calls still run in parallel; this only avoids paying
-# the handshake on each command.
+# the handshake on each command. The Playwright tunnel rides the same
+# connection, keyed by it so a reconnect invalidates the stale listener.
 _conns: dict[str, asyncssh.SSHClientConnection] = {}
+_tunnels: dict[str, tuple[asyncssh.SSHClientConnection, Any, int]] = {}
 _conn_lock = asyncio.Lock()
+_tunnel_lock = asyncio.Lock()
 
 
 async def open_conn(host: str) -> asyncssh.SSHClientConnection:
@@ -283,6 +297,12 @@ async def get_conn(host: str) -> asyncssh.SSHClientConnection:
 
 
 def drop_conn(host: str) -> None:
+    entry = _tunnels.pop(host, None)
+    if entry is not None:
+        try:
+            entry[1].close()
+        except Exception:
+            pass
     conn = _conns.pop(host, None)
     if conn is not None:
         try:
@@ -354,6 +374,73 @@ async def resolve(env_id: str) -> sqlite3.Row:
 
 
 # --------------------------------------------------------------------------
+# Playwright MCP, tunnelled over the same SSH connection
+# --------------------------------------------------------------------------
+
+
+async def pw_endpoint(host: str) -> str:
+    """Return a local URL that forwards to Playwright MCP on the runner.
+
+    asyncssh binds an ephemeral loopback port here and tunnels it to
+    127.0.0.1:PW_MCP_PORT on the environment, so nothing has to listen on the
+    tailnet and no serve rule is needed.
+    """
+    conn = await get_conn(host)
+    async with _tunnel_lock:
+        entry = _tunnels.get(host)
+        if entry is not None and entry[0] is conn:
+            return "http://127.0.0.1:" + str(entry[2]) + "/mcp"
+        listener = await conn.forward_local_port(
+            "127.0.0.1", 0, "127.0.0.1", PW_MCP_PORT
+        )
+        port = listener.get_port()
+        _tunnels[host] = (conn, listener, port)
+        return "http://127.0.0.1:" + str(port) + "/mcp"
+
+
+async def pw_session(host: str, timeout: int):
+    """Async context manager yielding an initialised upstream ClientSession."""
+    url = await pw_endpoint(host)
+    return streamablehttp_client(
+        url,
+        timeout=timedelta(seconds=timeout),
+        sse_read_timeout=timedelta(seconds=timeout + 60),
+    )
+
+
+async def pw_request(host: str, action, timeout: int):
+    """Run `action(session)` against Playwright MCP, reconnecting once."""
+    last: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            client = await pw_session(host, timeout)
+            async with client as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await action(session)
+        except (OSError, asyncssh.Error) as exc:
+            last = exc
+            drop_conn(host)
+    raise RuntimeError(
+        "could not reach Playwright MCP on "
+        + host
+        + ": "
+        + str(last)
+        + " (is the environment on profile=playwright, and finished booting?)"
+    )
+
+
+async def require_playwright(env_id: str) -> str:
+    row = await resolve(env_id)
+    if row["profile"] != "playwright":
+        raise ValueError(
+            "this environment was created with profile='base'; create one with "
+            "profile='playwright' to use the browser"
+        )
+    return host_for(row["host_id"])
+
+
+# --------------------------------------------------------------------------
 # MCP surface
 # --------------------------------------------------------------------------
 
@@ -362,7 +449,12 @@ MCP_KWARGS: dict[str, Any] = {
     "instructions": (
         "Disposable Linux environments backed by GitHub Actions runners.\n"
         "Call create_env once per conversation, keep the returned env_id, and "
-        "pass it to every exec call. Environments are wiped when they expire."
+        "pass it to every other call. Environments are wiped when they expire."
+        "\n\n"
+        "For browser automation, create the environment with "
+        "profile='playwright', then call browser_tools(env_id) once to see the "
+        "available Playwright tools and their arguments, and browser_call to "
+        "invoke them. Everything runs through this one server."
     ),
     "stateless_http": True,
     "streamable_http_path": "/mcp",
@@ -387,7 +479,9 @@ async def create_env(
     Returns immediately with state=provisioning; boot takes a few minutes.
     Poll wait_ready or env_status before running commands.
 
-    profile: "base" (shell only) or "playwright" (adds a Playwright MCP server).
+    profile: "base" (shell only) or "playwright" (shell plus a headless
+    Chromium driven through browser_call). Choose "playwright" up front: the
+    profile cannot be changed afterwards.
     """
     if profile not in ("base", "playwright"):
         raise ValueError("profile must be 'base' or 'playwright'")
@@ -425,7 +519,8 @@ async def create_env(
         "state": "provisioning",
         "expires_at": iso(expires),
         "note": "Keep env_id secret; it is the only credential for this box. "
-        "Boot usually takes 2-5 minutes.",
+        "Boot usually takes 2-5 minutes"
+        + (", longer for playwright (Chromium download)." if profile == "playwright" else "."),
     }
 
 
@@ -444,7 +539,11 @@ async def env_status(env_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]:
-    """Block until the environment answers, or until max_wait_seconds passes."""
+    """Block until the environment answers, or until max_wait_seconds passes.
+
+    Readiness means the shell answers. On profile='playwright' the browser may
+    need another minute or two after that; browser_call will say so.
+    """
     max_wait_seconds = max(5, min(int(max_wait_seconds), 240))
     deadline = now() + timedelta(seconds=max_wait_seconds)
     while now() < deadline:
@@ -482,6 +581,57 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
         timeout=max(10, min(int(timeout_seconds), 600)),
         sudo=True,
     )
+
+
+@mcp.tool()
+async def browser_tools(env_id: str) -> list[dict[str, Any]]:
+    """List the Playwright tools available in this environment.
+
+    Call this once before using browser_call. The set comes from the
+    playwright-mcp release installed on the runner, so it is authoritative for
+    that environment rather than baked into this broker.
+    """
+    host = await require_playwright(env_id)
+
+    async def action(session: ClientSession):
+        listed = await session.list_tools()
+        return [
+            {
+                "name": t.name,
+                "description": (t.description or "").strip(),
+                "input_schema": t.inputSchema,
+            }
+            for t in listed.tools
+        ]
+
+    return await pw_request(host, action, timeout=60)
+
+
+@mcp.tool()
+async def browser_call(
+    env_id: str,
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+    timeout_seconds: int = 120,
+):
+    """Invoke a Playwright tool in this environment's headless Chromium.
+
+    `tool` and `arguments` come from browser_tools, e.g.
+    tool="browser_navigate", arguments={"url": "https://example.com"}.
+    Browser state (pages, cookies, session) persists between calls for the
+    lifetime of the environment. Screenshots are returned as images.
+    """
+    host = await require_playwright(env_id)
+    timeout = max(10, min(int(timeout_seconds), 600))
+    args = arguments or {}
+
+    async def action(session: ClientSession):
+        result = await session.call_tool(tool, args)
+        # Content blocks are handed back untouched so image results survive
+        # the extra hop instead of being flattened to text.
+        return list(result.content)
+
+    return await pw_request(host, action, timeout=timeout)
 
 
 @mcp.tool()

@@ -4,9 +4,10 @@ name: Ephemeral MCP Env (broker-managed)
 #
 # Differences from ubuntu-playwright-mcp.yml (which is left untouched):
 #   * Started on demand by the broker, never by cron.
-#   * The shell is reached over Tailscale SSH, which tailscaled terminates
-#     itself. There is no sshd, no ssh-mcp and no mcp-proxy on this box, and
-#     nothing listens on the tailnet for the base profile.
+#   * Nothing is published on the tailnet. The shell is reached over
+#     Tailscale SSH, which tailscaled terminates itself, and Playwright MCP
+#     is reached by the broker through an SSH port forward. No sshd, no
+#     ssh-mcp, no mcp-proxy, no serve rule, no listening tailnet port.
 #   * Access is authenticated by the tailnet identity of the caller, so an
 #     ACL rule can allow the broker and nobody else.
 #   * Hostname is a random id chosen by the broker, so two environments
@@ -122,13 +123,15 @@ jobs:
           sudo tee /usr/local/bin/start-pw-mcp.sh > /dev/null <<EOS
           #!/usr/bin/env bash
           setsid npx @playwright/mcp@latest --port "${PW_MCP_PORT}" --host 127.0.0.1 --headless \
-            --allowed-hosts "${TS_HOST}" \
+            --allowed-hosts '*' \
             < /dev/null >> /tmp/pw-mcp.log 2>&1 &
           EOS
           sudo chmod +x /usr/local/bin/start-pw-mcp.sh
-          # --allowed-hosts is required (DNS-rebinding guard returns 403 for the
-          # MagicDNS Host header). Do NOT add --allowed-origins: that one is a
-          # browser navigation allowlist and would block every other site.
+          # Bound to loopback and never published on the tailnet: the broker
+          # reaches it through an SSH port forward, so the only way in is an
+          # ACL-authorised SSH session. That is why the DNS-rebinding guard can
+          # be switched off -- the Host header is whatever local port asyncssh
+          # happened to pick, and there is no browser in the path to protect.
           /usr/local/bin/start-pw-mcp.sh
           for i in $(seq 1 30); do
             if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp"; then
@@ -136,17 +139,12 @@ jobs:
             fi
             sleep 2
           done
-          # Playwright MCP speaks HTTP, so unlike the shell it does need a
-          # serve rule to be reachable under userspace-networking. Still
-          # tailnet-only: `serve`, never `funnel`.
-          sudo tailscale serve --bg --http="$PW_MCP_PORT" "http://127.0.0.1:$PW_MCP_PORT"
-          sudo tailscale serve status || true
 
       - name: Announce endpoints
         run: |
           echo "=================================================="
           echo "  Shell          : ssh runner@$TS_HOST   (Tailscale SSH, ACL gated)"
-          echo "  Playwright MCP : http://$TS_HOST:$PW_MCP_PORT/mcp   (profile=playwright)"
+          echo "  Playwright MCP : 127.0.0.1:$PW_MCP_PORT via SSH forward (profile=playwright)"
           echo "=================================================="
 
       - name: Keep alive
@@ -191,6 +189,5 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          sudo tailscale serve --http="$PW_MCP_PORT" off || true
           # Ephemeral auth key => the node disappears from the tailnet by itself.
           sudo tailscale logout || true

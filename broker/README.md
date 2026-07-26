@@ -1,7 +1,8 @@
 # Ephemeral environment broker
 
 A small always-on MCP server that hands out disposable Linux boxes running on
-GitHub Actions runners, one per conversation.
+GitHub Actions runners, one per conversation. Shell and browser are both
+reached through this single endpoint.
 
 ```
 Notion ──HTTPS + Bearer──▶ broker (Docker, on your tailnet)
@@ -9,16 +10,22 @@ Notion ──HTTPS + Bearer──▶ broker (Docker, on your tailnet)
                               ▼
                       GitHub Actions runner  "gha-env-<random>"
                               ▲
-                              └── SSH over the tailnet, terminated by
-                                  tailscaled's built-in SSH server
+                              ├─ SSH over the tailnet → shell
+                              └─ SSH port forward → 127.0.0.1:8931
+                                                     Playwright MCP
 ```
 
 ## Why it is built this way
 
-**Only the broker is public.** The environment listens on nothing at all for
-the `base` profile. Its shell is reached through Tailscale SSH, which
-tailscaled handles in-process, so it works under userspace-networking with no
-`serve` rule, no sshd and no open port.
+**The environment listens on nothing.** For both profiles. The shell is
+reached through Tailscale SSH, which tailscaled handles in-process, so it
+works under userspace-networking with no sshd and no open port. Playwright MCP
+binds loopback only and the broker tunnels to it over that same SSH
+connection, so it needs no `serve` rule either.
+
+**One endpoint, one token.** Clients never talk to a runner directly. The
+Playwright tools are re-exposed as `browser_tools` / `browser_call` on the
+broker, scoped by `env_id` like everything else.
 
 **The caller is authenticated by the tailnet.** Tailscale SSH checks the
 identity of the connecting node against your ACLs, so execution can be
@@ -108,11 +115,18 @@ bearer token, and list that same hostname in `BROKER_PUBLIC_HOSTS`.
 | `env_status(env_id)` | `provisioning` / `ready` plus expiry. |
 | `exec(env_id, command, timeout_seconds)` | Run a command as `runner`. |
 | `sudo_exec(env_id, command, timeout_seconds)` | Run a command as root. |
+| `browser_tools(env_id)` | List the Playwright tools this environment offers, with their schemas. |
+| `browser_call(env_id, tool, arguments)` | Invoke one of them. Screenshots come back as images. |
 | `destroy_env(env_id)` | Stop the runner and free capacity. |
 | `list_envs()` | Live environments, with `env_id` masked. |
 
-Profiles: `base` (shell only) or `playwright` (also starts a Playwright MCP
-server on port 8931, published on the tailnet with `tailscale serve`).
+Profiles: `base` (shell only) or `playwright` (adds headless Chromium). The
+profile is fixed at creation, so ask for `playwright` up front if the browser
+might be needed.
+
+Playwright is proxied generically rather than mirrored tool by tool, so a new
+playwright-mcp release changes what `browser_tools` reports without needing a
+broker release. The cost is one extra call at the start of a browsing session.
 
 ## Operational notes
 
@@ -120,10 +134,15 @@ server on port 8931, published on the tailnet with `tailscale serve`).
   channel per command, so calls run genuinely in parallel. Working directory
   and shell variables do **not** persist between calls — chain with
   `cd /path && ...`.
+- Browser state does persist: `browser_call` talks to one long-lived Chromium
+  for the life of the environment.
 - On timeout the broker closes that channel only. Nothing is `pkill`ed, so
   unrelated processes are never caught in the blast radius. For anything long,
   detach anyway: `nohup ... > /tmp/job.log 2>&1 &`.
-- A dead pooled connection is retried once transparently.
+- A dead pooled connection, and the Playwright tunnel riding on it, are
+  retried once transparently.
+- `wait_ready` reports readiness of the shell. On `playwright` the browser may
+  need another minute after that while Chromium finishes installing.
 - Jobs are hard-stopped by GitHub after 6 hours regardless of TTL.
 
 ### Troubleshooting
@@ -134,6 +153,7 @@ server on port 8931, published on the tailnet with `tailscale serve`).
 | `401 unauthorized` from the broker | `BROKER_TOKEN` mismatch between `.env` and the MCP client |
 | `ssh to ... failed: Permission denied` | Tailscale ACL does not grant `ssh` from the broker host to the environment, or `users` omits `runner` |
 | `ssh to ... failed` hangs then times out | ACL uses check mode (`checkPeriod`), which cannot work non-interactively |
+| `could not reach Playwright MCP` | Environment is on `profile='base'`, or Chromium is still installing — check `env-logs-*` artifact for `pw-mcp.log` |
 | `create_env` works, `wait_ready` never turns ready | The container cannot resolve MagicDNS. `docker compose exec broker python -c "import socket;print(socket.gethostbyname('<host>'))"` |
 | Name resolution fails but `100.x` IPs ping | `dns:` is not taking effect, or tailscaled is in userspace mode on this host |
 | `workflow_dispatch failed: 404` | The PAT lacks Actions write, or `ephemeral-env.yml` is not on the default branch |
