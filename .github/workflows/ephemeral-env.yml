@@ -13,7 +13,8 @@ name: Ephemeral MCP Env (broker-managed)
 #   * Hostname is a random id chosen by the broker, so two environments
 #     can never collide.
 #   * GH_PAT is injected (the same secret as ubuntu-playwright-mcp.yml) so
-#     git push/pull works from Tailscale SSH sessions out of the box.
+#     git push/pull and the gh CLI both work from Tailscale SSH sessions out
+#     of the box.
 
 on:
   workflow_dispatch:
@@ -57,13 +58,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure git to authenticate to GitHub via PAT (for SSH sessions)
+      - name: Configure git and gh to authenticate to GitHub via PAT (for SSH sessions)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_ACTOR: ${{ github.actor }}
         run: |
           if [ -z "$GH_PAT" ]; then
-            echo "GH_PAT secret not set; skipping git credential setup"
+            echo "GH_PAT secret not set; skipping git/gh credential setup"
           else
             # credential.helper store reads ~/.git-credentials for every
             # https://github.com git operation, so any SSH session as 'runner'
@@ -83,6 +84,17 @@ jobs:
             git -C "$GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
             git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git" 2>/dev/null || true
             echo "git configured for GitHub auth (user: $GH_ACTOR)"
+            # The gh CLI keeps its own credential store
+            # (~/.config/gh/hosts.yml) and never reads ~/.git-credentials, so
+            # it has to be logged in separately with the same PAT. Do NOT run
+            # 'gh auth setup-git' afterwards: it would replace the 'store'
+            # credential helper configured above.
+            if printf '%s' "$GH_PAT" | gh auth login --hostname github.com \
+                 --git-protocol https --with-token; then
+              echo "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo unknown)"
+            else
+              echo "::warning::gh auth login failed; gh CLI stays unauthenticated"
+            fi
           fi
 
       - name: Install base packages
