@@ -1,8 +1,6 @@
 name: Windows RDP via Tailscale
 
 on:
-  schedule:
-    - cron: "7 */6 * * *"
   workflow_dispatch:
     inputs:
       session_minutes:
