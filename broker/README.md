@@ -58,6 +58,51 @@ a public repository.
 **Ephemeral Tailscale nodes.** Devices deregister themselves when the job ends,
 so there is no cleanup step that could delete a sibling environment by mistake.
 
+## macOS environments
+
+`create_env(platform="macos")` dispatches `.github/workflows/ephemeral-env-macos.yml`
+on a `macos-15` runner instead of `ephemeral-env.yml`. Everything a client sees
+is unchanged: same endpoint, same bearer token, same `env_id`, same `exec` /
+`sudo_exec` / `destroy_env`.
+
+What had to change under the hood is authentication. **The Tailscale SSH server
+is Linux-only** -- the macOS CLI build of `tailscaled` never starts it -- so
+there is nothing on macOS that can authenticate the broker by tailnet identity.
+Instead:
+
+1. the broker mints an ed25519 keypair per environment and stores the private
+   half next to the `env_id`,
+2. the **public** half is passed in as the `ssh_pubkey` workflow input, which is
+   safe even though workflow inputs are world-readable,
+3. the job writes it to `~/.ssh/authorized_keys`, starts its own `sshd` bound to
+   `127.0.0.1:2222`, and publishes that with
+   `tailscale serve --bg --tcp 2222 tcp://127.0.0.1:2222`.
+
+So the runner still opens no port to the internet, still needs no TUN device,
+and access is gated twice: the tailnet ACL decides who may reach port 2222, the
+keypair decides who may log in.
+
+The ACL therefore needs a port rule as well as (or instead of) the `ssh` block:
+
+```json
+"acls": [{
+  "action": "accept",
+  "src":    ["tag:broker"],
+  "dst":    ["tag:gha-env:2222"]
+}]
+```
+
+Profiles on macOS are `base`, `playwright` and `xcode`; the last one runs
+`xcode-select` against the image default Xcode and installs XcodeGen, which is
+what an iOS project generated from a `project.yml` needs.
+
+Caveats worth knowing before you reach for it:
+
+* macOS minutes bill at **10x** Linux minutes on GitHub-hosted runners.
+* Boot is slower (4-8 minutes; Homebrew installs Tailscale from scratch).
+* Runners are arm64 (Apple silicon).
+* `serve` must be permitted for the `tag:gha-env` nodes in your tailnet.
+
 ## Setup
 
 ### 1. Tailscale auth key

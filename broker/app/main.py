@@ -137,6 +137,11 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "animationsaver")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "windows")
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "ephemeral-env.yml")
+# macOS twin of the workflow above. Same contract, different runner and a
+# different SSH story (see SSH_PORT_MACOS).
+WORKFLOW_FILE_MACOS = os.environ.get(
+    "WORKFLOW_FILE_MACOS", "ephemeral-env-macos.yml"
+)
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
 MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
@@ -169,6 +174,12 @@ GET_STREAM = env_flag("BROKER_GET_STREAM", False)
 # there is no key to distribute.
 SSH_USER = os.environ.get("SSH_USER", "runner")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+
+# macOS: the Tailscale SSH *server* is Linux-only (the macOS CLI build never
+# starts it), so those environments run their own sshd on loopback and publish
+# it with `tailscale serve --tcp`. Authentication is a throwaway keypair minted
+# per environment instead of the tailnet identity, and the port is not 22.
+SSH_PORT_MACOS = int(os.environ.get("SSH_PORT_MACOS", "2222"))
 SSH_CONNECT_TIMEOUT = int(os.environ.get("SSH_CONNECT_TIMEOUT", "20"))
 
 # Loopback port Playwright MCP binds on the runner. Never published; reached
@@ -186,6 +197,13 @@ PUBLIC_HOSTS = [
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
+PLATFORMS = ("linux", "macos")
+# Which profiles each platform knows how to build. "xcode" only means anything
+# on a macOS runner.
+PROFILES = {
+    "linux": ("base", "playwright"),
+    "macos": ("base", "playwright", "xcode"),
+}
 
 
 class ExecTimeout(RuntimeError):
@@ -266,13 +284,26 @@ def init_db() -> None:
                 label      TEXT,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                ready_at   TEXT
+                ready_at   TEXT,
+                platform   TEXT NOT NULL DEFAULT 'linux',
+                ssh_port   INTEGER,
+                ssh_key    TEXT
             )
             """
         )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_host_id ON envs(host_id)"
         )
+        # Databases created before macOS support predate the last three
+        # columns; add them in place rather than asking for a wipe.
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(envs)")}
+        for column, decl in (
+            ("platform", "TEXT NOT NULL DEFAULT 'linux'"),
+            ("ssh_port", "INTEGER"),
+            ("ssh_key", "TEXT"),
+        ):
+            if column not in have:
+                conn.execute("ALTER TABLE envs ADD COLUMN " + column + " " + decl)
 
 
 def reap() -> None:
@@ -293,6 +324,20 @@ def live_count() -> int:
 
 def new_host_id() -> str:
     return "".join(secrets.choice(HOST_ALPHABET) for _ in range(12))
+
+
+def new_keypair() -> tuple[str, str]:
+    """Mint a throwaway ed25519 keypair for one macOS environment.
+
+    The private half stays in the broker database next to the env_id; only the
+    public half is passed to the workflow, which is why it is safe that
+    workflow inputs are readable by anyone who can read the repository.
+    """
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    return (
+        key.export_private_key("openssh").decode(),
+        key.export_public_key("openssh").decode().strip(),
+    )
 
 
 def get_env(env_id: str) -> sqlite3.Row | None:
@@ -317,12 +362,32 @@ def host_for(host_id: str) -> str:
     return "gha-env-" + host_id + "." + TAILNET_DOMAIN
 
 
+def target_for(row: sqlite3.Row) -> str:
+    """Return a row's hostname and record how to authenticate to that host.
+
+    The SSH layer is keyed by hostname alone, so registering the per-platform
+    port and key here keeps every call site a one-liner.
+    """
+    host = host_for(row["host_id"])
+    if (row["platform"] or "linux") == "macos":
+        _ssh_auth[host] = (int(row["ssh_port"] or SSH_PORT_MACOS), row["ssh_key"])
+    else:
+        _ssh_auth[host] = (SSH_PORT, None)
+    return host
+
+
 # --------------------------------------------------------------------------
 # github
 # --------------------------------------------------------------------------
 
 
-async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> None:
+async def dispatch_workflow(
+    host_id: str,
+    ttl_minutes: int,
+    profile: str,
+    workflow_file: str = WORKFLOW_FILE,
+    extra_inputs: dict[str, str] | None = None,
+) -> None:
     url = (
         API_ROOT
         + "/repos/"
@@ -330,7 +395,7 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
         + "/"
         + GITHUB_REPO
         + "/actions/workflows/"
-        + WORKFLOW_FILE
+        + workflow_file
         + "/dispatches"
     )
     payload = {
@@ -342,6 +407,7 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
             "env_host": host_id,
             "ttl_minutes": str(ttl_minutes),
             "profile": profile,
+            **(extra_inputs or {}),
         },
     }
     headers = {
@@ -349,7 +415,7 @@ async def dispatch_workflow(host_id: str, ttl_minutes: int, profile: str) -> Non
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    log.info("dispatching %s for gha-env-%s (%s)", WORKFLOW_FILE, host_id, profile)
+    log.info("dispatching %s for gha-env-%s (%s)", workflow_file, host_id, profile)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code not in (202, 204):
@@ -373,6 +439,9 @@ _conns: dict[str, asyncssh.SSHClientConnection] = {}
 _tunnels: dict[str, tuple[asyncssh.SSHClientConnection, Any, int]] = {}
 _conn_lock = asyncio.Lock()
 _tunnel_lock = asyncio.Lock()
+# host -> (port, private key PEM or None). Filled in by target_for(); the
+# default covers Linux (Tailscale SSH on 22, "none" auth).
+_ssh_auth: dict[str, tuple[int, str | None]] = {}
 
 
 async def open_conn(host: str) -> asyncssh.SSHClientConnection:
@@ -380,13 +449,19 @@ async def open_conn(host: str) -> asyncssh.SSHClientConnection:
     # "none" method, which is what Tailscale SSH accepts once its ACL has
     # authorised this node. known_hosts is off because the runner's key is
     # generated fresh on every boot; the tailnet is the trust anchor here.
-    log.debug("ssh connect %s@%s:%s", SSH_USER, host, SSH_PORT)
+    port, key_pem = _ssh_auth.get(host, (SSH_PORT, None))
+    # macOS environments run a real sshd, so present the key minted for them;
+    # Linux ones keep client_keys empty and fall through to "none".
+    client_keys = [asyncssh.import_private_key(key_pem)] if key_pem else []
+    log.debug(
+        "ssh connect %s@%s:%s key=%s", SSH_USER, host, port, bool(key_pem)
+    )
     conn = await asyncssh.connect(
         host,
-        port=SSH_PORT,
+        port=port,
         username=SSH_USER,
         known_hosts=None,
-        client_keys=[],
+        client_keys=client_keys,
         config=None,
         connect_timeout=SSH_CONNECT_TIMEOUT,
     )
@@ -566,7 +641,7 @@ async def require_playwright(env_id: str) -> str:
             "this environment was created with profile='base'; create one with "
             "profile='playwright' to use the browser"
         )
-    return host_for(row["host_id"])
+    return target_for(row)
 
 
 # --------------------------------------------------------------------------
@@ -576,10 +651,15 @@ async def require_playwright(env_id: str) -> str:
 MCP_KWARGS: dict[str, Any] = {
     "name": "gha-env-broker",
     "instructions": (
-        "Disposable Linux environments backed by GitHub Actions runners.\n"
+        "Disposable Linux and macOS environments backed by GitHub Actions "
+        "runners.\n"
         "Call create_env once per conversation, keep the returned env_id, and "
         "pass it to every other call. Environments are wiped when they expire."
         "\n\n"
+        "For Xcode, Swift or anything else that needs Apple tooling, create the "
+        "environment with platform='macos' (and profile='xcode' to get Xcode "
+        "selected plus XcodeGen). exec, sudo_exec and destroy_env behave "
+        "identically on both platforms.\n\n"
         "For browser automation, create the environment with "
         "profile='playwright', then call browser_tools(env_id) once to see the "
         "available Playwright tools and their arguments, and browser_call to "
@@ -604,18 +684,32 @@ async def create_env(
     ttl_minutes: int = DEFAULT_TTL,
     profile: str = "base",
     label: str = "",
+    platform: str = "linux",
 ) -> dict[str, Any]:
     """Provision a fresh disposable environment and return its secret env_id.
 
     Returns immediately with state=provisioning; boot takes a few minutes.
     Poll wait_ready or env_status before running commands.
 
-    profile: "base" (shell only) or "playwright" (shell plus a headless
-    Chromium driven through browser_call). Choose "playwright" up front: the
-    profile cannot be changed afterwards.
+    platform: "linux" (Ubuntu runner, the default) or "macos" (macOS runner,
+    for Xcode, Swift and anything else that needs Apple tooling). macOS boots
+    slower and burns Actions minutes at ~10x the Linux rate, so only ask for it
+    when you actually need it.
+
+    profile: "base" (shell only), "playwright" (shell plus a headless Chromium
+    driven through browser_call) or, on macOS only, "xcode" (Xcode selected and
+    XcodeGen installed). Choose it up front: neither platform nor profile can
+    be changed afterwards.
     """
-    if profile not in ("base", "playwright"):
-        raise ValueError("profile must be 'base' or 'playwright'")
+    if platform not in PLATFORMS:
+        raise ValueError("platform must be 'linux' or 'macos'")
+    if profile not in PROFILES[platform]:
+        raise ValueError(
+            "profile for platform '"
+            + platform
+            + "' must be one of "
+            + ", ".join(PROFILES[platform])
+        )
     ttl_minutes = max(1, min(int(ttl_minutes), 350))
 
     reap()
@@ -630,14 +724,43 @@ async def create_env(
     host_id = new_host_id()
     created = now()
     expires = created + timedelta(minutes=ttl_minutes)
+    # macOS has no Tailscale SSH server, so that environment runs its own sshd
+    # and has to be told which key to trust. Only the public half is handed to
+    # the workflow.
+    key_pem: str | None = None
+    pubkey: str | None = None
+    ssh_port = SSH_PORT
+    if platform == "macos":
+        key_pem, pubkey = new_keypair()
+        ssh_port = SSH_PORT_MACOS
     with db() as conn:
         conn.execute(
-            "INSERT INTO envs (env_id, host_id, profile, state, label, created_at, expires_at)"
-            " VALUES (?, ?, ?, 'provisioning', ?, ?, ?)",
-            (env_id, host_id, profile, label, iso(created), iso(expires)),
+            "INSERT INTO envs (env_id, host_id, profile, state, label,"
+            " created_at, expires_at, platform, ssh_port, ssh_key)"
+            " VALUES (?, ?, ?, 'provisioning', ?, ?, ?, ?, ?, ?)",
+            (
+                env_id,
+                host_id,
+                profile,
+                label,
+                iso(created),
+                iso(expires),
+                platform,
+                ssh_port,
+                key_pem,
+            ),
         )
     try:
-        await dispatch_workflow(host_id, ttl_minutes, profile)
+        if platform == "macos":
+            await dispatch_workflow(
+                host_id,
+                ttl_minutes,
+                profile,
+                workflow_file=WORKFLOW_FILE_MACOS,
+                extra_inputs={"ssh_pubkey": pubkey or ""},
+            )
+        else:
+            await dispatch_workflow(host_id, ttl_minutes, profile)
     except Exception:
         with db() as conn:
             conn.execute("DELETE FROM envs WHERE env_id = ?", (env_id,))
@@ -646,12 +769,21 @@ async def create_env(
     return {
         "env_id": env_id,
         "host": host_for(host_id),
+        "platform": platform,
         "profile": profile,
         "state": "provisioning",
         "expires_at": iso(expires),
         "note": "Keep env_id secret; it is the only credential for this box. "
-        "Boot usually takes 2-5 minutes"
-        + (", longer for playwright (Chromium download)." if profile == "playwright" else "."),
+        + (
+            "Boot usually takes 4-8 minutes on macOS"
+            if platform == "macos"
+            else "Boot usually takes 2-5 minutes"
+        )
+        + (
+            ", longer for playwright (Chromium download)."
+            if profile == "playwright"
+            else "."
+        ),
     }
 
 
@@ -699,7 +831,7 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """
     row = await resolve(env_id)
     return await ssh_run(
-        host_for(row["host_id"]),
+        target_for(row),
         command,
         timeout=max(10, min(int(timeout_seconds), 600)),
     )
@@ -711,7 +843,7 @@ async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> st
     """Run a shell command as root inside the environment identified by env_id."""
     row = await resolve(env_id)
     return await ssh_run(
-        host_for(row["host_id"]),
+        target_for(row),
         command,
         timeout=max(10, min(int(timeout_seconds), 600)),
         sudo=True,
@@ -808,6 +940,7 @@ async def list_envs() -> list[dict[str, Any]]:
         {
             "host": host_for(r["host_id"]),
             "state": r["state"],
+            "platform": r["platform"],
             "profile": r["profile"],
             "label": r["label"],
             "env_id_prefix": r["env_id"][:6] + "...",
