@@ -1,0 +1,263 @@
+name: Ephemeral MCP Env - macOS (broker-managed)
+
+# macOS twin of ephemeral-env.yml.
+#
+# Difference that drives the whole design: Tailscale SSH (the server side) is a
+# Linux feature. The macOS CLI build of tailscaled does not start it, so the
+# broker cannot authenticate by tailnet identity alone here. Instead the broker
+# mints a throwaway ed25519 keypair per environment, passes only the PUBLIC key
+# in as a workflow input (public keys are not secrets, which matters because
+# workflow inputs are world-readable), and this job runs its own sshd on
+# loopback and publishes it on the tailnet with `tailscale serve --tcp`, so the
+# runner still exposes nothing to the internet and still needs no TUN device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_host:
+        description: "Random hostname suffix; node joins as gha-env-<value>"
+        required: true
+      ttl_minutes:
+        description: "Self-destruct after this many minutes (max 350)"
+        required: false
+        default: "350"
+      profile:
+        description: "base | playwright | xcode"
+        required: false
+        default: "base"
+      ssh_pubkey:
+        description: "OpenSSH public key line the broker will authenticate with"
+        required: true
+
+concurrency:
+  group: gha-env-${{ inputs.env_host }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      ENV_HOST: ${{ inputs.env_host }}
+      PROFILE: ${{ inputs.profile }}
+      TTL_MINUTES: ${{ inputs.ttl_minutes }}
+      SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
+      SSH_PORT: "2222"
+      PW_MCP_PORT: "8931"
+      SSHD_DIR: /Users/runner/env-sshd
+
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$ENV_HOST" | grep -Eq '^[a-z0-9]{8,32}$'; then
+            echo "env_host must be 8-32 chars of [a-z0-9]" >&2
+            exit 1
+          fi
+          case "$PROFILE" in
+            base|playwright|xcode) ;;
+            *) echo "profile must be base, playwright or xcode" >&2; exit 1 ;;
+          esac
+          if [ "$(printf '%s' "$SSH_PUBKEY" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "ssh_pubkey must be a single line" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$SSH_PUBKEY" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+( .*)?$'; then
+            echo "ssh_pubkey is not an OpenSSH public key line" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Configure git to authenticate to GitHub via PAT
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "GH_PAT is not set; git will stay unauthenticated" >&2
+            exit 0
+          fi
+          git config --global credential.helper store
+          git config --global user.name "$GH_ACTOR"
+          git config --global user.email "${GH_ACTOR}@users.noreply.github.com"
+          printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
+          chmod 600 "$HOME/.git-credentials"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cd "$GITHUB_WORKSPACE"
+          git config --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git"
+
+      - name: Select Xcode and install XcodeGen (profile=xcode)
+        if: ${{ inputs.profile == 'xcode' }}
+        run: |
+          set -euo pipefail
+          # macos-15 ships several Xcodes; /Applications/Xcode.app is the image
+          # default and is what xcodebuild should resolve to.
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          swift --version
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Install Playwright MCP (profile=playwright)
+        if: ${{ inputs.profile == 'playwright' }}
+        run: |
+          set -euo pipefail
+          npm install -g @playwright/mcp@latest
+          npx playwright install chromium
+
+      - name: Install Tailscale (CLI build) and join the tailnet
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          brew install tailscale
+          TS_BIN="$(brew --prefix tailscale)/bin"
+          echo "TS_BIN=$TS_BIN" >> "$GITHUB_ENV"
+          sudo mkdir -p /var/lib/tailscale
+          # userspace-networking: no utun device, nothing bound on the tailnet.
+          sudo nohup "$TS_BIN/tailscaled" \
+            --tun=userspace-networking \
+            --socks5-server=localhost:1055 \
+            --statedir=/var/lib/tailscale \
+            > /tmp/tailscaled.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if sudo "$TS_BIN/tailscale" status >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          sudo "$TS_BIN/tailscale" up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="gha-env-$ENV_HOST" \
+            --accept-routes \
+            --accept-dns=false
+          DNSNAME="$(sudo "$TS_BIN/tailscale" status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"])')"
+          echo "joined as $DNSNAME"
+          case "$DNSNAME" in
+            gha-env-$ENV_HOST.*) ;;
+            *) echo "hostname collision: asked for gha-env-$ENV_HOST, got $DNSNAME" >&2; exit 1 ;;
+          esac
+
+      - name: Start sshd on loopback with the broker public key
+        run: |
+          set -euo pipefail
+          mkdir -p "$SSHD_DIR" "$HOME/.ssh"
+          chmod 700 "$SSHD_DIR" "$HOME/.ssh"
+          printf '%s\n' "$SSH_PUBKEY" > "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          ssh-keygen -q -t ed25519 -N '' -C "gha-env-$ENV_HOST" -f "$SSHD_DIR/host_ed25519"
+          cat > "$SSHD_DIR/sshd_config" <<CONF
+          Port $SSH_PORT
+          ListenAddress 127.0.0.1
+          HostKey $SSHD_DIR/host_ed25519
+          AuthorizedKeysFile $HOME/.ssh/authorized_keys
+          AllowUsers runner
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          PermitTTY yes
+          AllowTcpForwarding yes
+          X11Forwarding no
+          PrintMotd no
+          LogLevel VERBOSE
+          PidFile $SSHD_DIR/sshd.pid
+          CONF
+          # sshd insists on an absolute path because it re-execs itself.
+          sudo /usr/sbin/sshd -f "$SSHD_DIR/sshd_config" -E /tmp/sshd.log
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 "$SSH_PORT"; then break; fi
+            sleep 1
+          done
+          nc -z 127.0.0.1 "$SSH_PORT"
+
+      - name: Publish sshd on the tailnet
+        run: |
+          set -euo pipefail
+          # Plain TCP forward, terminated inside tailscaled, so it works under
+          # userspace-networking. Reachability is still gated by the tailnet
+          # ACL; the keypair gates the login itself.
+          sudo "$TS_BIN/tailscale" serve --bg --tcp "$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT"
+          sudo "$TS_BIN/tailscale" serve status
+
+      - name: Start Playwright MCP (profile=playwright)
+        if: ${{ inputs.profile == 'playwright' }}
+        run: |
+          set -euo pipefail
+          cat > "$HOME/start-pw-mcp.sh" <<'SH'
+          #!/bin/bash
+          exec npx -y @playwright/mcp@latest \
+            --port "${PW_MCP_PORT:-8931}" \
+            --host 127.0.0.1 \
+            --headless \
+            --isolated \
+            --no-sandbox
+          SH
+          chmod +x "$HOME/start-pw-mcp.sh"
+          nohup "$HOME/start-pw-mcp.sh" > /tmp/pw-mcp.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if nc -z 127.0.0.1 "$PW_MCP_PORT"; then break; fi
+            sleep 2
+          done
+          nc -z 127.0.0.1 "$PW_MCP_PORT" || (tail -50 /tmp/pw-mcp.log; exit 1)
+
+      - name: Announce endpoints
+        run: |
+          set -euo pipefail
+          echo "host:    gha-env-$ENV_HOST (tailnet)"
+          echo "shell:   ssh -p $SSH_PORT runner@gha-env-$ENV_HOST"
+          echo "profile: $PROFILE"
+          sw_vers
+          uname -m
+
+      - name: Keep alive until TTL or stop signal
+        run: |
+          set -uo pipefail
+          MIN="${TTL_MINUTES:-350}"
+          case "$MIN" in ''|*[!0-9]*) MIN=350 ;; esac
+          [ "$MIN" -gt 350 ] && MIN=350
+          [ "$MIN" -lt 1 ] && MIN=1
+          DEADLINE=$(( $(date +%s) + MIN * 60 ))
+          echo "staying up for $MIN minute(s)"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if [ -f /tmp/stop.txt ]; then
+              echo "stop signal received; shutting down"
+              break
+            fi
+            if ! nc -z 127.0.0.1 "$SSH_PORT" >/dev/null 2>&1; then
+              echo "sshd is down; restarting it"
+              sudo /usr/sbin/sshd -f "$SSHD_DIR/sshd_config" -E /tmp/sshd.log || true
+            fi
+            if [ "$PROFILE" = playwright ] && ! nc -z 127.0.0.1 "$PW_MCP_PORT" >/dev/null 2>&1; then
+              echo "playwright mcp is down; restarting it"
+              nohup "$HOME/start-pw-mcp.sh" >> /tmp/pw-mcp.log 2>&1 &
+            fi
+            sleep 30
+          done
+
+      - name: Collect logs
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p env-logs
+          for f in /tmp/sshd.log /tmp/tailscaled.log /tmp/pw-mcp.log; do
+            [ -f "$f" ] && cp "$f" env-logs/ || true
+          done
+          ls -la env-logs || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: env-logs-${{ inputs.env_host }}-${{ github.run_id }}
+          path: env-logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Leave the tailnet
+        if: always()
+        run: |
+          set -uo pipefail
+          sudo "${TS_BIN:-/opt/homebrew/bin}/tailscale" serve reset || true
+          sudo "${TS_BIN:-/opt/homebrew/bin}/tailscale" logout || true
