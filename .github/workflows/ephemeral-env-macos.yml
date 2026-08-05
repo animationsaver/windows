@@ -69,7 +69,7 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Configure git to authenticate to GitHub via PAT
+      - name: Configure git and gh to authenticate to GitHub via PAT
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_ACTOR: ${{ github.actor }}
@@ -89,6 +89,18 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git config --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git"
+          # gh keeps its own credential store (~/.config/gh/hosts.yml) and
+          # never reads ~/.git-credentials, so it has to be logged in
+          # separately with the same PAT -- otherwise `gh` in an SSH session
+          # reports "not logged into any GitHub hosts" even though git works.
+          # Do NOT run 'gh auth setup-git' afterwards: it would replace the
+          # 'store' credential helper configured above.
+          if printf '%s' "$GH_PAT" | gh auth login --hostname github.com \
+               --git-protocol https --with-token; then
+            echo "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo unknown)"
+          else
+            echo "::warning::gh auth login failed; gh CLI stays unauthenticated"
+          fi
 
       - name: Select Xcode and install XcodeGen (profile=xcode)
         if: ${{ inputs.profile == 'xcode' }}
