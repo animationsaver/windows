@@ -89,18 +89,23 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git config --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git"
-          # gh keeps its own credential store (~/.config/gh/hosts.yml) and
-          # never reads ~/.git-credentials, so it has to be logged in
-          # separately with the same PAT -- otherwise `gh` in an SSH session
-          # reports "not logged into any GitHub hosts" even though git works.
-          # Do NOT run 'gh auth setup-git' afterwards: it would replace the
-          # 'store' credential helper configured above.
-          if printf '%s' "$GH_PAT" | gh auth login --hostname github.com \
-               --git-protocol https --with-token; then
-            echo "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo unknown)"
-          else
-            echo "::warning::gh auth login failed; gh CLI stays unauthenticated"
-          fi
+          # gh on macOS stores its token in the login keychain rather than in
+          # ~/.config/gh/hosts.yml, and that keychain is not unlocked in a
+          # non-interactive SSH session. A plain `gh auth login` here therefore
+          # produced a box where `gh auth status` reported "the token in
+          # default is invalid" even though git worked perfectly. Hand gh the
+          # PAT through the environment instead: GH_TOKEN wins over any stored
+          # credential and sidesteps the keychain entirely.
+          #
+          # The runner's login shell is bash and broker commands arrive as
+          # non-interactive ssh commands, which read neither .bashrc nor
+          # .bash_profile -- so the value has to come from sshd itself, via
+          # ~/.ssh/environment plus PermitUserEnvironment in sshd_config.
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf 'GH_TOKEN=%s\n' "$GH_PAT" > "$HOME/.ssh/environment"
+          chmod 600 "$HOME/.ssh/environment"
+          echo "gh will authenticate as $(GH_TOKEN="$GH_PAT" gh api user --jq .login 2>/dev/null || echo unknown)"
 
       - name: Select Xcode and install XcodeGen (profile=xcode)
         if: ${{ inputs.profile == 'xcode' }}
@@ -170,6 +175,8 @@ jobs:
           PasswordAuthentication no
           KbdInteractiveAuthentication no
           UsePAM no
+          # Lets sshd export GH_TOKEN from ~/.ssh/environment; see the PAT step.
+          PermitUserEnvironment yes
           PermitTTY yes
           AllowTcpForwarding yes
           X11Forwarding no
