@@ -792,7 +792,13 @@ async def create_env(
 async def env_status(env_id: str) -> dict[str, Any]:
     """Report whether the environment is still provisioning or ready to use."""
     row = await resolve(env_id)
-    host = host_for(row["host_id"])
+    # target_for(), not host_for(): the probe below goes through the same SSH
+    # path as exec, and on macOS that means port 2222 plus the per-environment
+    # key. host_for() alone leaves _ssh_auth unset, so the probe fell back to
+    # the Linux defaults (port 22, "none" auth), which a real sshd rejects --
+    # the environment then stayed "provisioning" until it expired even though
+    # the runner was up and healthy.
+    host = target_for(row)
     if row["state"] == "ready":
         return {"state": "ready", "host": host, "expires_at": row["expires_at"]}
     if await probe(host):
@@ -908,7 +914,9 @@ async def browser_call(
 async def destroy_env(env_id: str) -> dict[str, Any]:
     """Shut the environment down now and free up capacity."""
     row = await resolve(env_id)
-    host = host_for(row["host_id"])
+    # Same reason as env_status(): the graceful stop is an SSH command, so it
+    # needs the platform's port and key, not just the hostname.
+    host = target_for(row)
     stopped = False
     try:
         # The workflow's keep-alive loop watches for this file.

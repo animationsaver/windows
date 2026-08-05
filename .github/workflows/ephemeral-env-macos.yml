@@ -182,6 +182,31 @@ jobs:
           sudo "$TS_BIN/tailscale" serve --bg --tcp "$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT"
           sudo "$TS_BIN/tailscale" serve status
 
+      - name: Verify sshd is reachable over the tailnet
+        run: |
+          set -euo pipefail
+          # The broker never talks to 127.0.0.1; it dials <tailnet ip>:$SSH_PORT.
+          # Prove that exact path works here, the way the Linux twin does with
+          # its "Verify Tailscale SSH is accepting" step. Failing loudly at this
+          # point is far easier to diagnose than an environment that silently
+          # stays "provisioning" until its TTL runs out.
+          TS_IP="$(sudo "$TS_BIN/tailscale" ip -4)"
+          echo "tailnet ip: $TS_IP"
+          for _ in $(seq 1 30); do
+            BANNER="$( (exec 3<>"/dev/tcp/$TS_IP/$SSH_PORT" && head -c 20 <&3) 2>/dev/null || true)"
+            case "$BANNER" in
+              SSH-2.0-*)
+                echo "sshd answers on $TS_IP:$SSH_PORT ($BANNER)"
+                exit 0
+                ;;
+            esac
+            sleep 2
+          done
+          echo "sshd is NOT reachable on $TS_IP:$SSH_PORT from the tailnet" >&2
+          sudo "$TS_BIN/tailscale" serve status || true
+          tail -50 /tmp/sshd.log || true
+          exit 1
+
       - name: Start Playwright MCP (profile=playwright)
         if: ${{ inputs.profile == 'playwright' }}
         run: |
@@ -229,6 +254,12 @@ jobs:
             if ! nc -z 127.0.0.1 "$SSH_PORT" >/dev/null 2>&1; then
               echo "sshd is down; restarting it"
               sudo /usr/sbin/sshd -f "$SSHD_DIR/sshd_config" -E /tmp/sshd.log || true
+            fi
+            # sshd listening again is not enough: without the serve rule the
+            # port is only open on loopback and the broker still cannot get in.
+            if ! sudo "$TS_BIN/tailscale" serve status 2>/dev/null | grep -q "$SSH_PORT"; then
+              echo "tailnet forward for $SSH_PORT is gone; re-applying it"
+              sudo "$TS_BIN/tailscale" serve --bg --tcp "$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT" || true
             fi
             if [ "$PROFILE" = playwright ] && ! nc -z 127.0.0.1 "$PW_MCP_PORT" >/dev/null 2>&1; then
               echo "playwright mcp is down; restarting it"
