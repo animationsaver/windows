@@ -201,30 +201,35 @@ jobs:
           sudo "$TS_BIN/tailscale" serve --bg --tcp "$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT"
           sudo "$TS_BIN/tailscale" serve status
 
-      - name: Verify sshd is reachable over the tailnet
+      - name: Verify sshd is published on the tailnet
         run: |
           set -euo pipefail
-          # The broker never talks to 127.0.0.1; it dials <tailnet ip>:$SSH_PORT.
-          # Prove that exact path works here, the way the Linux twin does with
-          # its "Verify Tailscale SSH is accepting" step. Failing loudly at this
-          # point is far easier to diagnose than an environment that silently
-          # stays "provisioning" until its TTL runs out.
-          TS_IP="$(sudo "$TS_BIN/tailscale" ip -4)"
-          echo "tailnet ip: $TS_IP"
-          for _ in $(seq 1 30); do
-            BANNER="$( (exec 3<>"/dev/tcp/$TS_IP/$SSH_PORT" && head -c 20 <&3) 2>/dev/null || true)"
-            case "$BANNER" in
-              SSH-2.0-*)
-                echo "sshd answers on $TS_IP:$SSH_PORT ($BANNER)"
-                exit 0
-                ;;
-            esac
+          # Do NOT dial this node's own tailnet IP from here. With
+          # --tun=userspace-networking there is no loopback path back to our
+          # own 100.x address, so a self-dial hangs for ~9s and then fails even
+          # though peers reach us perfectly well. An earlier version of this
+          # step did exactly that: the loop burned ~4.5 minutes and then tore
+          # the whole environment down about six minutes after boot, right
+          # after the broker had already marked it ready.
+          #
+          # What this node can honestly observe locally is that sshd is
+          # listening and that tailscaled is forwarding the tailnet port to it.
+          nc -z 127.0.0.1 "$SSH_PORT"
+          echo "sshd is listening on 127.0.0.1:$SSH_PORT"
+          for _ in $(seq 1 15); do
+            if sudo "$TS_BIN/tailscale" serve status 2>/dev/null \
+                 | grep -q "tcp://127.0.0.1:$SSH_PORT"; then
+              echo "tailnet forward is in place:"
+              sudo "$TS_BIN/tailscale" serve status
+              exit 0
+            fi
             sleep 2
           done
-          echo "sshd is NOT reachable on $TS_IP:$SSH_PORT from the tailnet" >&2
+          echo "tailscaled is not forwarding the tailnet port to sshd" >&2
           sudo "$TS_BIN/tailscale" serve status || true
-          tail -50 /tmp/sshd.log || true
+          sudo tail -50 /tmp/sshd.log || true
           exit 1
+
 
       - name: Start Playwright MCP (profile=playwright)
         if: ${{ inputs.profile == 'playwright' }}
