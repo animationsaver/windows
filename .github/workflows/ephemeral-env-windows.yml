@@ -131,7 +131,11 @@ jobs:
             Write-Host "::warning::gh auth login failed; relying on GH_TOKEN"
           }
           $who = gh api user --jq .login 2>$null
-          Write-Host "git and gh configured for $who"
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($who)) {
+            Write-Host "::warning::GH_PAT did not authenticate against the API; git and gh will be unauthenticated inside this environment"
+          } else {
+            Write-Host "git and gh configured for $who"
+          }
           exit 0
 
       - name: Install and configure OpenSSH Server for the broker
@@ -228,7 +232,11 @@ jobs:
           [IO.File]::WriteAllText($env:ADMIN_KEYS, "$broker`n$mine`n", $utf8)
           icacls $env:ADMIN_KEYS /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
 
-          $probe = '$PSVersionTable.PSVersion.ToString(); whoami; (gh api user --jq .login)'
+          # The probe has to end in 'exit 0'. pwsh -Command reports the exit
+          # code of the last native command it ran, so without it an expired
+          # GH_PAT makes gh exit non-zero, ssh return non-zero, and this step
+          # discard an environment whose SSH path is perfectly healthy.
+          $probe = '$PSVersionTable.PSVersion.ToString(); whoami; gh api user --jq .login; exit 0'
           $out = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -i $testKey -p $env:SSH_PORT "$env:SSH_LOGIN_USER@127.0.0.1" $probe 2>&1
           $code = $LASTEXITCODE
 
@@ -245,6 +253,11 @@ jobs:
           }
           if (-not (($out -join "`n") -match 'runneradmin')) {
             throw "self-test did not run as $env:SSH_LOGIN_USER"
+          }
+          # A dead PAT is a degraded environment, not a broken one: the shell,
+          # the default shell and the key authentication are all proven above.
+          if (($out -join "`n") -match 'Bad credentials|gh auth login|HTTP 401') {
+            Write-Host "::warning::gh is not authenticated inside the SSH session; refresh the GH_PAT secret"
           }
           Write-Host "ssh + PowerShell 7 default shell verified"
 
