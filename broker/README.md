@@ -1,6 +1,6 @@
 # Ephemeral environment broker
 
-A small always-on MCP server that hands out disposable Linux boxes running on
+A small always-on MCP server that hands out disposable Linux, macOS and Windows boxes running on
 GitHub Actions runners, one per conversation. Shell and browser are both
 reached through this single endpoint.
 
@@ -102,6 +102,48 @@ Caveats worth knowing before you reach for it:
 * Boot is slower (4-8 minutes; Homebrew installs Tailscale from scratch).
 * Runners are arm64 (Apple silicon).
 * `serve` must be permitted for the `tag:gha-env` nodes in your tailnet.
+
+## Windows environments
+
+`create_env(platform="windows")` dispatches `.github/workflows/ephemeral-env-windows.yml`
+on a `windows-latest` runner. The client contract is unchanged again: same
+endpoint, same bearer token, same `env_id`, same `exec` / `sudo_exec` /
+`destroy_env`.
+
+Authentication works like macOS -- the Tailscale SSH server is Linux-only, so
+the broker mints an ed25519 keypair per environment and the job hands the
+public half to the Windows OpenSSH service. Three things are genuinely
+different:
+
+1. **The account is `runneradmin`**, not `runner`, because that is who GitHub's
+   Windows images run as (`SSH_USER_WINDOWS`).
+2. **Commands arrive in PowerShell 7.** sshd's `DefaultShell` is set to
+   `pwsh.exe` with `DefaultShellCommandOption=-Command`, so `exec` takes
+   PowerShell, not bash, and the broker sends the command through unwrapped
+   instead of quoting it for `bash -lc`. There is no `sudo`: the job sets
+   `LocalAccountTokenFilterPolicy=1`, so the SSH logon carries runneradmin's
+   full administrator token and `sudo_exec` runs the command unchanged.
+3. **sshd is published by the firewall, not by `tailscale serve`.** tailscaled
+   runs in kernel mode with a real adapter on Windows, so sshd simply listens
+   on 2222 and an inbound rule limits it to the tailnet CGNAT range
+   `100.64.0.0/10`. A GitHub runner has no inbound path from the internet in
+   any case.
+
+`GH_TOKEN` is published through the machine and user registry environment
+rather than `~/.ssh/environment`, because Windows OpenSSH does not implement
+`PermitUserEnvironment`; sshd builds the session environment with
+`CreateEnvironmentBlock`, so `git` and `gh` are authenticated in every broker
+command. `credential.helper` is reset to `store` first, because Git for Windows
+ships `manager` at system level and that helper cannot prompt over SSH.
+
+Before it reports itself alive the job logs into its own sshd over loopback
+with a throwaway key and runs a command, so a wrong `DefaultShell` or a
+rejected `authorized_keys` fails the workflow instead of leaving the broker
+waiting for an environment that will never answer.
+
+The tailnet ACL needs the same port rule as macOS (`tag:gha-env:2222`).
+Profiles are `base` and `playwright`; Windows minutes bill at 2x Linux and boot
+takes roughly 3-6 minutes.
 
 ## Setup
 
