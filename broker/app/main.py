@@ -4,7 +4,8 @@ The broker is the only component exposed to the internet, and the only MCP
 endpoint a client ever connects to. It:
 
   1. mints a high-entropy ``env_id`` per conversation/session,
-  2. dispatches ``ephemeral-env.yml`` with a random hostname,
+  2. dispatches the workflow that matches the requested platform with a
+     random hostname,
   3. runs commands on the environment that owns that ``env_id`` over
      Tailscale SSH,
   4. re-exposes the environment's Playwright MCP server through an SSH port
@@ -142,6 +143,12 @@ WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "ephemeral-env.yml")
 WORKFLOW_FILE_MACOS = os.environ.get(
     "WORKFLOW_FILE_MACOS", "ephemeral-env-macos.yml"
 )
+# Windows twin. Same contract again, and the same "bring your own sshd" story
+# as macOS, but a different login account and a different shell; see
+# SSH_USER_WINDOWS and wrap().
+WORKFLOW_FILE_WINDOWS = os.environ.get(
+    "WORKFLOW_FILE_WINDOWS", "ephemeral-env-windows.yml"
+)
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
 MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
@@ -180,6 +187,14 @@ SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 # it with `tailscale serve --tcp`. Authentication is a throwaway keypair minted
 # per environment instead of the tailnet identity, and the port is not 22.
 SSH_PORT_MACOS = int(os.environ.get("SSH_PORT_MACOS", "2222"))
+
+# Windows: no Tailscale SSH server either, so those environments run the
+# Windows OpenSSH service on this port, firewalled to the tailnet, and the
+# broker authenticates with the same kind of per-environment keypair. Two
+# further differences the rest of this file keys off: GitHub's Windows images
+# log in as "runneradmin", and that sshd's DefaultShell is PowerShell 7.
+SSH_PORT_WINDOWS = int(os.environ.get("SSH_PORT_WINDOWS", "2222"))
+SSH_USER_WINDOWS = os.environ.get("SSH_USER_WINDOWS", "runneradmin")
 SSH_CONNECT_TIMEOUT = int(os.environ.get("SSH_CONNECT_TIMEOUT", "20"))
 
 # Loopback port Playwright MCP binds on the runner. Never published; reached
@@ -197,12 +212,38 @@ PUBLIC_HOSTS = [
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
-PLATFORMS = ("linux", "macos")
+PLATFORMS = ("linux", "macos", "windows")
 # Which profiles each platform knows how to build. "xcode" only means anything
 # on a macOS runner.
 PROFILES = {
     "linux": ("base", "playwright"),
     "macos": ("base", "playwright", "xcode"),
+    "windows": ("base", "playwright"),
+}
+# Platforms whose environments run an sshd of their own, and therefore need a
+# throwaway keypair instead of the tailnet identity of the caller.
+KEY_AUTH_PLATFORMS = ("macos", "windows")
+# Per-platform lookups, so adding a platform stays a table edit rather than
+# another if/else in every call site.
+WORKFLOW_FILES = {
+    "linux": WORKFLOW_FILE,
+    "macos": WORKFLOW_FILE_MACOS,
+    "windows": WORKFLOW_FILE_WINDOWS,
+}
+SSH_PORTS = {
+    "linux": SSH_PORT,
+    "macos": SSH_PORT_MACOS,
+    "windows": SSH_PORT_WINDOWS,
+}
+SSH_USERS = {
+    "linux": SSH_USER,
+    "macos": SSH_USER,
+    "windows": SSH_USER_WINDOWS,
+}
+BOOT_NOTES = {
+    "linux": "Boot usually takes 2-5 minutes",
+    "macos": "Boot usually takes 4-8 minutes on macOS",
+    "windows": "Boot usually takes 3-6 minutes on Windows",
 }
 
 
@@ -362,17 +403,25 @@ def host_for(host_id: str) -> str:
     return "gha-env-" + host_id + "." + TAILNET_DOMAIN
 
 
+def platform_of(row: sqlite3.Row) -> str:
+    """Platform of a row, defaulting rows written before platforms existed."""
+    return row["platform"] or "linux"
+
+
 def target_for(row: sqlite3.Row) -> str:
     """Return a row's hostname and record how to authenticate to that host.
 
     The SSH layer is keyed by hostname alone, so registering the per-platform
-    port and key here keeps every call site a one-liner.
+    port, account and key here keeps every call site a one-liner.
     """
     host = host_for(row["host_id"])
-    if (row["platform"] or "linux") == "macos":
-        _ssh_auth[host] = (int(row["ssh_port"] or SSH_PORT_MACOS), row["ssh_key"])
+    platform = platform_of(row)
+    user = SSH_USERS.get(platform, SSH_USER)
+    if platform in KEY_AUTH_PLATFORMS:
+        port = int(row["ssh_port"] or SSH_PORTS[platform])
+        _ssh_auth[host] = (port, row["ssh_key"], user)
     else:
-        _ssh_auth[host] = (SSH_PORT, None)
+        _ssh_auth[host] = (SSH_PORT, None, user)
     return host
 
 
@@ -439,9 +488,10 @@ _conns: dict[str, asyncssh.SSHClientConnection] = {}
 _tunnels: dict[str, tuple[asyncssh.SSHClientConnection, Any, int]] = {}
 _conn_lock = asyncio.Lock()
 _tunnel_lock = asyncio.Lock()
-# host -> (port, private key PEM or None). Filled in by target_for(); the
-# default covers Linux (Tailscale SSH on 22, "none" auth).
-_ssh_auth: dict[str, tuple[int, str | None]] = {}
+# host -> (port, private key PEM or None, login account). Filled in by
+# target_for(); the default covers Linux (Tailscale SSH on 22, "none" auth,
+# the "runner" account).
+_ssh_auth: dict[str, tuple[int, str | None, str]] = {}
 
 
 async def open_conn(host: str) -> asyncssh.SSHClientConnection:
@@ -449,17 +499,15 @@ async def open_conn(host: str) -> asyncssh.SSHClientConnection:
     # "none" method, which is what Tailscale SSH accepts once its ACL has
     # authorised this node. known_hosts is off because the runner's key is
     # generated fresh on every boot; the tailnet is the trust anchor here.
-    port, key_pem = _ssh_auth.get(host, (SSH_PORT, None))
-    # macOS environments run a real sshd, so present the key minted for them;
-    # Linux ones keep client_keys empty and fall through to "none".
+    port, key_pem, user = _ssh_auth.get(host, (SSH_PORT, None, SSH_USER))
+    # macOS and Windows environments run a real sshd, so present the key minted
+    # for them; Linux ones keep client_keys empty and fall through to "none".
     client_keys = [asyncssh.import_private_key(key_pem)] if key_pem else []
-    log.debug(
-        "ssh connect %s@%s:%s key=%s", SSH_USER, host, port, bool(key_pem)
-    )
+    log.debug("ssh connect %s@%s:%s key=%s", user, host, port, bool(key_pem))
     conn = await asyncssh.connect(
         host,
         port=port,
-        username=SSH_USER,
+        username=user,
         known_hosts=None,
         client_keys=client_keys,
         config=None,
@@ -495,16 +543,27 @@ def drop_conn(host: str) -> None:
             pass
 
 
-def wrap(command: str, sudo: bool) -> str:
+def wrap(command: str, sudo: bool, platform: str = "linux") -> str:
+    if platform == "windows":
+        # sshd's DefaultShell there is PowerShell 7 and the exec request
+        # reaches it verbatim, so there is no POSIX shell to quote for.
+        # Elevation is not a separate step either: the workflow sets
+        # LocalAccountTokenFilterPolicy=1, so the session already holds
+        # runneradmin's full administrator token and sudo is a no-op.
+        return command
     inner = "bash -lc " + shlex.quote(command)
     return "sudo -n " + inner if sudo else inner
 
 
 async def ssh_run(
-    host: str, command: str, timeout: int = 180, sudo: bool = False
+    host: str,
+    command: str,
+    timeout: int = 180,
+    sudo: bool = False,
+    platform: str = "linux",
 ) -> str:
     """Run one command in its own SSH channel and return its combined output."""
-    line = wrap(command, sudo)
+    line = wrap(command, sudo, platform)
     last: Exception | None = None
     # A pooled connection may have died with the runner in between calls;
     # one silent reconnect is worth more than surfacing that to the caller.
@@ -544,9 +603,12 @@ async def ssh_run(
     )
 
 
-async def probe(host: str, timeout: int = 15) -> bool:
+async def probe(host: str, timeout: int = 15, platform: str = "linux") -> bool:
+    # "true" is a shell builtin PowerShell does not have; "exit 0" is the one
+    # no-op both understand.
+    noop = "exit 0" if platform == "windows" else "true"
     try:
-        await ssh_run(host, "true", timeout=timeout)
+        await ssh_run(host, noop, timeout=timeout, platform=platform)
         return True
     except Exception as exc:
         log.info("probe of %s not ready yet: %s", host, exc)
@@ -651,15 +713,18 @@ async def require_playwright(env_id: str) -> str:
 MCP_KWARGS: dict[str, Any] = {
     "name": "gha-env-broker",
     "instructions": (
-        "Disposable Linux and macOS environments backed by GitHub Actions "
-        "runners.\n"
+        "Disposable Linux, macOS and Windows environments backed by GitHub "
+        "Actions runners.\n"
         "Call create_env once per conversation, keep the returned env_id, and "
         "pass it to every other call. Environments are wiped when they expire."
         "\n\n"
         "For Xcode, Swift or anything else that needs Apple tooling, create the "
         "environment with platform='macos' (and profile='xcode' to get Xcode "
-        "selected plus XcodeGen). exec, sudo_exec and destroy_env behave "
-        "identically on both platforms.\n\n"
+        "selected plus XcodeGen). For PowerShell, .NET or anything else that "
+        "needs Windows, use platform='windows': commands then run in "
+        "PowerShell 7 as an administrator, so write PowerShell syntax and use "
+        "exec for elevated commands too. exec, sudo_exec and destroy_env "
+        "behave identically on all three platforms.\n\n"
         "For browser automation, create the environment with "
         "profile='playwright', then call browser_tools(env_id) once to see the "
         "available Playwright tools and their arguments, and browser_call to "
@@ -691,10 +756,12 @@ async def create_env(
     Returns immediately with state=provisioning; boot takes a few minutes.
     Poll wait_ready or env_status before running commands.
 
-    platform: "linux" (Ubuntu runner, the default) or "macos" (macOS runner,
-    for Xcode, Swift and anything else that needs Apple tooling). macOS boots
-    slower and burns Actions minutes at ~10x the Linux rate, so only ask for it
-    when you actually need it.
+    platform: "linux" (Ubuntu runner, the default), "macos" (macOS runner, for
+    Xcode, Swift and anything else that needs Apple tooling) or "windows"
+    (Windows Server runner; commands run in PowerShell 7 as an administrator,
+    so sudo_exec is the same call as exec). macOS boots slower and burns
+    Actions minutes at ~10x the Linux rate and Windows at ~2x, so only ask for
+    them when you actually need them.
 
     profile: "base" (shell only), "playwright" (shell plus a headless Chromium
     driven through browser_call) or, on macOS only, "xcode" (Xcode selected and
@@ -702,7 +769,7 @@ async def create_env(
     be changed afterwards.
     """
     if platform not in PLATFORMS:
-        raise ValueError("platform must be 'linux' or 'macos'")
+        raise ValueError("platform must be one of " + ", ".join(PLATFORMS))
     if profile not in PROFILES[platform]:
         raise ValueError(
             "profile for platform '"
@@ -724,15 +791,15 @@ async def create_env(
     host_id = new_host_id()
     created = now()
     expires = created + timedelta(minutes=ttl_minutes)
-    # macOS has no Tailscale SSH server, so that environment runs its own sshd
-    # and has to be told which key to trust. Only the public half is handed to
-    # the workflow.
+    # macOS and Windows have no Tailscale SSH server, so those environments run
+    # an sshd of their own and have to be told which key to trust. Only the
+    # public half is handed to the workflow.
     key_pem: str | None = None
     pubkey: str | None = None
     ssh_port = SSH_PORT
-    if platform == "macos":
+    if platform in KEY_AUTH_PLATFORMS:
         key_pem, pubkey = new_keypair()
-        ssh_port = SSH_PORT_MACOS
+        ssh_port = SSH_PORTS[platform]
     with db() as conn:
         conn.execute(
             "INSERT INTO envs (env_id, host_id, profile, state, label,"
@@ -751,12 +818,12 @@ async def create_env(
             ),
         )
     try:
-        if platform == "macos":
+        if platform in KEY_AUTH_PLATFORMS:
             await dispatch_workflow(
                 host_id,
                 ttl_minutes,
                 profile,
-                workflow_file=WORKFLOW_FILE_MACOS,
+                workflow_file=WORKFLOW_FILES[platform],
                 extra_inputs={"ssh_pubkey": pubkey or ""},
             )
         else:
@@ -774,11 +841,7 @@ async def create_env(
         "state": "provisioning",
         "expires_at": iso(expires),
         "note": "Keep env_id secret; it is the only credential for this box. "
-        + (
-            "Boot usually takes 4-8 minutes on macOS"
-            if platform == "macos"
-            else "Boot usually takes 2-5 minutes"
-        )
+        + BOOT_NOTES.get(platform, "Boot usually takes 2-5 minutes")
         + (
             ", longer for playwright (Chromium download)."
             if profile == "playwright"
@@ -793,15 +856,15 @@ async def env_status(env_id: str) -> dict[str, Any]:
     """Report whether the environment is still provisioning or ready to use."""
     row = await resolve(env_id)
     # target_for(), not host_for(): the probe below goes through the same SSH
-    # path as exec, and on macOS that means port 2222 plus the per-environment
-    # key. host_for() alone leaves _ssh_auth unset, so the probe fell back to
+    # path as exec, and on macOS and Windows that means port 2222 plus the
+    # per-environment key. host_for() alone leaves _ssh_auth unset, so the probe fell back to
     # the Linux defaults (port 22, "none" auth), which a real sshd rejects --
     # the environment then stayed "provisioning" until it expired even though
     # the runner was up and healthy.
     host = target_for(row)
     if row["state"] == "ready":
         return {"state": "ready", "host": host, "expires_at": row["expires_at"]}
-    if await probe(host):
+    if await probe(host, platform=platform_of(row)):
         set_state(env_id, "ready", ready=True)
         return {"state": "ready", "host": host, "expires_at": row["expires_at"]}
     return {"state": "provisioning", "host": host, "expires_at": row["expires_at"]}
@@ -830,29 +893,40 @@ async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]
 async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """Run a shell command inside the environment identified by env_id.
 
+    Linux and macOS environments run it in bash. Windows environments run it in
+    PowerShell 7, so write PowerShell there: Get-ChildItem rather than ls, `;`
+    rather than `&&`, $env:VAR rather than $VAR.
+
     Each call gets its own SSH channel, so calls may run in parallel. State
     such as the working directory is NOT carried between calls; chain with
-    `cd /path && ...` instead. For long jobs, detach with
-    `nohup ... > /tmp/job.log 2>&1 &` and poll the log.
+    `cd /path && ...` (`cd C:\\path; ...` on Windows) instead. For long jobs,
+    detach with `nohup ... > /tmp/job.log 2>&1 &` (Start-Process or Start-Job
+    on Windows) and poll the log.
     """
     row = await resolve(env_id)
     return await ssh_run(
         target_for(row),
         command,
         timeout=max(10, min(int(timeout_seconds), 600)),
+        platform=platform_of(row),
     )
 
 
 @mcp.tool()
 @traced
 async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
-    """Run a shell command as root inside the environment identified by env_id."""
+    """Run a shell command as root inside the environment identified by env_id.
+
+    On Windows there is nothing to elevate: the SSH session already carries
+    runneradmin's full administrator token, so this is exactly exec.
+    """
     row = await resolve(env_id)
     return await ssh_run(
         target_for(row),
         command,
         timeout=max(10, min(int(timeout_seconds), 600)),
         sudo=True,
+        platform=platform_of(row),
     )
 
 
@@ -917,10 +991,16 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
     # Same reason as env_status(): the graceful stop is an SSH command, so it
     # needs the platform's port and key, not just the hostname.
     host = target_for(row)
+    platform = platform_of(row)
     stopped = False
     try:
         # The workflow's keep-alive loop watches for this file.
-        await ssh_run(host, "touch /tmp/stop.txt", timeout=30)
+        stop_file = (
+            "New-Item -ItemType File -Force -Path C:\\stop.txt | Out-Null"
+            if platform == "windows"
+            else "touch /tmp/stop.txt"
+        )
+        await ssh_run(host, stop_file, timeout=30, platform=platform)
         stopped = True
     except Exception as exc:
         log.warning("graceful stop of %s failed: %s", host, exc)

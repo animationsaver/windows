@@ -1,0 +1,375 @@
+name: Ephemeral MCP Env - Windows (broker-managed)
+
+# Windows twin of ephemeral-env.yml and ephemeral-env-macos.yml.
+#
+# Same driver as macOS: the Tailscale SSH *server* is Linux-only, so the broker
+# cannot be authenticated by tailnet identity here either. It mints a throwaway
+# ed25519 keypair per environment, passes only the PUBLIC half in as a workflow
+# input (inputs are world-readable on a public repository; public keys are not
+# secrets), and this job hands that key to the Windows OpenSSH service.
+#
+# Where Windows differs, and what the broker has to know about it:
+#   * the account is runneradmin, not runner -- that is who GitHub's Windows
+#     images run as;
+#   * sshd's DefaultShell is PowerShell 7, so broker commands arrive as
+#     PowerShell rather than bash, and there is no sudo. Instead
+#     LocalAccountTokenFilterPolicy=1 gives the SSH logon runneradmin's full
+#     administrator token, so exec is already elevated and sudo_exec is the
+#     same call;
+#   * Windows OpenSSH does not implement PermitUserEnvironment, so GH_TOKEN is
+#     published through the registry environment instead of ~/.ssh/environment;
+#   * tailscaled runs in kernel mode with a real adapter here, so rather than a
+#     tailscale serve rule sshd listens normally and an inbound firewall rule
+#     limits it to the tailnet's CGNAT range. A GitHub runner has no inbound
+#     path from the internet either way.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_host:
+        description: "Random hostname suffix; node joins as gha-env-<value>"
+        required: true
+      ttl_minutes:
+        description: "Self-destruct after this many minutes (max 350)"
+        required: false
+        default: "350"
+      profile:
+        description: "base = shell only | playwright = shell + Playwright MCP"
+        required: false
+        default: "base"
+      ssh_pubkey:
+        description: "OpenSSH public key line the broker will authenticate with"
+        required: true
+
+concurrency:
+  group: gha-env-${{ inputs.env_host }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ENV_HOST: ${{ inputs.env_host }}
+      PROFILE: ${{ inputs.profile }}
+      TTL_MINUTES: ${{ inputs.ttl_minutes }}
+      SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
+      SSH_PORT: "2222"
+      PW_MCP_PORT: "8931"
+      SSH_LOGIN_USER: "runneradmin"
+      STOP_FILE: 'C:\stop.txt'
+      WORK_DIR: 'C:\gha-env'
+      ADMIN_KEYS: 'C:\ProgramData\ssh\administrators_authorized_keys'
+      SSHD_CONFIG: 'C:\ProgramData\ssh\sshd_config'
+      SSHD_LOG: 'C:\ProgramData\ssh\logs\sshd.log'
+      TS_EXE: 'C:\Program Files\Tailscale\tailscale.exe'
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if ($env:ENV_HOST -notmatch '^[a-z0-9]{8,32}$') {
+            throw "env_host must be 8-32 characters of [a-z0-9]"
+          }
+          if (@('base', 'playwright') -notcontains $env:PROFILE) {
+            throw "profile must be base or playwright"
+          }
+          $key = "$env:SSH_PUBKEY".Trim()
+          if ($key.Contains("`n")) { throw "ssh_pubkey must be a single line" }
+          if ($key -notmatch '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+( .*)?$') {
+            throw "ssh_pubkey is not an OpenSSH public key line"
+          }
+          New-Item -ItemType Directory -Force -Path $env:WORK_DIR | Out-Null
+          Write-Host "hostname will be gha-env-$env:ENV_HOST, profile $env:PROFILE"
+
+      - uses: actions/checkout@v4
+
+      - name: Configure git and gh to authenticate to GitHub via PAT
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_PAT)) {
+            Write-Host "::warning::GH_PAT is not set; git and gh stay unauthenticated"
+            exit 0
+          }
+          # Git for Windows ships credential.helper=manager in the SYSTEM
+          # config. That helper wants to open a window, which a non-interactive
+          # SSH session can never satisfy, so drop it and use the same plain
+          # 'store' helper as the Linux and macOS environments.
+          git config --system --unset-all credential.helper 2>$null
+          git config --global --unset-all credential.helper 2>$null
+          git config --global credential.helper store
+          git config --global user.name "$env:GH_ACTOR"
+          git config --global user.email "$env:GH_ACTOR@users.noreply.github.com"
+          # No BOM, LF terminated: git reads this file line by line and a UTF-8
+          # BOM makes the first entry unusable.
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText("$HOME\.git-credentials",
+            "https://x-access-token:$($env:GH_PAT)@github.com`n", $utf8)
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          # actions/checkout leaves a short-lived GITHUB_TOKEN in an
+          # http.extraheader on the workspace clone; drop it so SSH sessions
+          # fall back to the PAT instead of an expired token.
+          git -C "$env:GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>$null
+          git -C "$env:GITHUB_WORKSPACE" remote set-url origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          # gh keeps its own credential store and never reads .git-credentials.
+          # The macOS trick of ~/.ssh/environment is not available here because
+          # Windows OpenSSH does not implement PermitUserEnvironment, so put the
+          # token in the registry environment instead: sshd builds the session
+          # environment with CreateEnvironmentBlock, which reads both scopes
+          # below, so every broker command sees GH_TOKEN.
+          [Environment]::SetEnvironmentVariable("GH_TOKEN", $env:GH_PAT, "Machine")
+          [Environment]::SetEnvironmentVariable("GH_TOKEN", $env:GH_PAT, "User")
+          $env:GH_TOKEN = $env:GH_PAT
+          # Best effort; GH_TOKEN above wins over anything gh stores anyway.
+          $env:GH_PAT | gh auth login --hostname github.com --git-protocol https --with-token
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::gh auth login failed; relying on GH_TOKEN"
+          }
+          $who = gh api user --jq .login 2>$null
+          Write-Host "git and gh configured for $who"
+          exit 0
+
+      - name: Install and configure OpenSSH Server for the broker
+        run: |
+          $sshd = Join-Path $env:WINDIR "System32\OpenSSH\sshd.exe"
+          if (-not (Test-Path $sshd)) {
+            Write-Host "OpenSSH Server is not on the image; adding the capability"
+            Add-WindowsCapability -Online -Name "OpenSSH.Server~~~~0.0.1.0" | Out-Null
+          }
+          if (-not (Test-Path $sshd)) { throw "OpenSSH Server could not be installed" }
+
+          # One start/stop cycle so the service creates C:\ProgramData\ssh and
+          # its host keys before the stock config is replaced below.
+          Set-Service -Name sshd -StartupType Automatic
+          Start-Service sshd
+          Stop-Service sshd
+
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          # sshd looks up keys for members of the Administrators group in
+          # administrators_authorized_keys rather than in the user's ~/.ssh,
+          # and runneradmin is an administrator. Only SYSTEM and Administrators
+          # may have access to that file or sshd ignores it.
+          [IO.File]::WriteAllText($env:ADMIN_KEYS, "$env:SSH_PUBKEY".Trim() + "`n", $utf8)
+          icacls $env:ADMIN_KEYS /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
+
+          # AllowTcpForwarding is what lets the broker tunnel to Playwright MCP
+          # on loopback, exactly as it does on the other two platforms.
+          $cfg = @(
+            "Port $env:SSH_PORT",
+            "ListenAddress 0.0.0.0",
+            "AllowUsers $env:SSH_LOGIN_USER",
+            "PubkeyAuthentication yes",
+            "PasswordAuthentication no",
+            "AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys",
+            "AllowTcpForwarding yes",
+            "PermitTTY yes",
+            "PrintMotd no",
+            "StrictModes no",
+            "SyslogFacility LOCAL0",
+            "LogLevel VERBOSE",
+            "Subsystem sftp sftp-server.exe"
+          ) -join "`r`n"
+          [IO.File]::WriteAllText($env:SSHD_CONFIG, $cfg + "`r`n", $utf8)
+
+          # sshd hands an exec request to DefaultShell. Pointing that at
+          # PowerShell 7 is what makes broker commands PowerShell; -Command is
+          # required because pwsh does not understand cmd's /c, and turning the
+          # escaping off keeps the quoting in those commands intact.
+          $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+          if (-not $pwsh) { $pwsh = "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
+          New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $pwsh -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShellCommandOption -Value "-Command" -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShellEscapeArguments -Value 0 -PropertyType DWord -Force | Out-Null
+
+          # A network logon by a local administrator normally gets a filtered
+          # token, so anything needing elevation would fail even though
+          # runneradmin is an admin. With this policy the SSH session carries
+          # the full token, which is why the broker's sudo_exec can run the
+          # command unchanged.
+          $sys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+          New-ItemProperty -Path $sys -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
+
+          # The capability's own rule only covers port 22. This one is limited
+          # to the tailnet's CGNAT range, so the port answers peers on the
+          # tailnet and nothing else.
+          Remove-NetFirewallRule -DisplayName "gha-env sshd" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "gha-env sshd" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $env:SSH_PORT -RemoteAddress 100.64.0.0/10 | Out-Null
+
+          Start-Service sshd
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Get-NetTCPConnection -LocalPort ([int]$env:SSH_PORT) -State Listen -ErrorAction SilentlyContinue) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not (Get-NetTCPConnection -LocalPort ([int]$env:SSH_PORT) -State Listen -ErrorAction SilentlyContinue)) {
+            Get-Content $env:SSHD_LOG -Tail 50 -ErrorAction SilentlyContinue
+            throw "sshd is not listening on port $env:SSH_PORT"
+          }
+          Write-Host "sshd is listening on $env:SSH_PORT for $env:SSH_LOGIN_USER"
+
+      - name: Self-test the SSH path the broker will use
+        run: |
+          # Log in to our own sshd over loopback with a throwaway key and run a
+          # command. A wrong DefaultShell, a rejected authorized_keys or a
+          # missing GH_TOKEN then fails the workflow here, instead of leaving
+          # the broker waiting for an environment that will never answer.
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $testKey = Join-Path $env:WORK_DIR "selftest_ed25519"
+          Remove-Item "$testKey*" -Force -ErrorAction SilentlyContinue
+          ssh-keygen -q -t ed25519 -N '' -C selftest -f $testKey
+          $broker = "$env:SSH_PUBKEY".Trim()
+          $mine = (Get-Content "$testKey.pub" -Raw).Trim()
+          [IO.File]::WriteAllText($env:ADMIN_KEYS, "$broker`n$mine`n", $utf8)
+          icacls $env:ADMIN_KEYS /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
+
+          $probe = '$PSVersionTable.PSVersion.ToString(); whoami; (gh api user --jq .login)'
+          $out = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -i $testKey -p $env:SSH_PORT "$env:SSH_LOGIN_USER@127.0.0.1" $probe 2>&1
+          $code = $LASTEXITCODE
+
+          # Put the broker's key back on its own before reporting anything.
+          [IO.File]::WriteAllText($env:ADMIN_KEYS, "$broker`n", $utf8)
+          icacls $env:ADMIN_KEYS /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
+          Remove-Item "$testKey*" -Force -ErrorAction SilentlyContinue
+
+          Write-Host "self-test output:"
+          $out | ForEach-Object { Write-Host "  $_" }
+          if ($code -ne 0) {
+            Get-Content $env:SSHD_LOG -Tail 60 -ErrorAction SilentlyContinue
+            throw "self-test ssh failed with exit code $code"
+          }
+          if (-not (($out -join "`n") -match 'runneradmin')) {
+            throw "self-test did not run as $env:SSH_LOGIN_USER"
+          }
+          Write-Host "ssh + PowerShell 7 default shell verified"
+
+      - name: Install Tailscale and join the tailnet
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "TS_AUTHKEY secret is not set"
+          }
+          $msi = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          # TS_UNATTENDEDMODE keeps tailscaled connected with nobody logged in,
+          # which is exactly the situation on a runner.
+          Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msi`" /quiet /norestart TS_UNATTENDEDMODE=always"
+          for ($i = 0; $i -lt 60; $i++) {
+            if (Test-Path $env:TS_EXE) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not (Test-Path $env:TS_EXE)) { throw "Tailscale did not install" }
+          for ($i = 0; $i -lt 60; $i++) {
+            $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            if ($svc) { Start-Service Tailscale -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 2
+          }
+          & $env:TS_EXE up --authkey="$env:TS_AUTHKEY" --hostname="gha-env-$env:ENV_HOST" --accept-routes --unattended
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed" }
+          Start-Sleep -Seconds 3
+          $status = & $env:TS_EXE status --json | ConvertFrom-Json
+          $dns = $status.Self.DNSName.TrimEnd('.')
+          Write-Host "joined as $dns ($(& $env:TS_EXE ip -4))"
+          # On a name collision Tailscale silently appends "-1" and the broker
+          # would talk to the wrong box. Fail loudly instead.
+          if ($dns -notlike "gha-env-$($env:ENV_HOST).*") {
+            throw "hostname collision: asked for gha-env-$env:ENV_HOST, got $dns"
+          }
+
+      - name: Install Playwright MCP (profile=playwright)
+        if: ${{ inputs.profile == 'playwright' }}
+        run: |
+          npm install -g "@playwright/mcp@latest"
+          npx playwright install chromium
+          $start = Join-Path $env:WORK_DIR "start-pw-mcp.ps1"
+          $lines = @(
+            '$port = if ($env:PW_MCP_PORT) { $env:PW_MCP_PORT } else { "8931" }',
+            '$argv = @("-y", "@playwright/mcp@latest", "--port", $port, "--host", "127.0.0.1", "--headless", "--isolated", "--allowed-hosts", "*")',
+            'Start-Process -FilePath "npx.cmd" -ArgumentList $argv -WindowStyle Hidden -RedirectStandardOutput "C:\gha-env\pw-mcp.log" -RedirectStandardError "C:\gha-env\pw-mcp.err.log"'
+          ) -join "`r`n"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText($start, $lines + "`r`n", $utf8)
+          # Bound to loopback and never published on the tailnet: the broker
+          # reaches it through an SSH port forward, so an authorised SSH
+          # session is the only way in.
+          & $start
+          for ($i = 0; $i -lt 60; $i++) {
+            if ((Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded) {
+            Get-Content "C:\gha-env\pw-mcp.err.log" -Tail 40 -ErrorAction SilentlyContinue
+            throw "Playwright MCP did not come up on 127.0.0.1:$env:PW_MCP_PORT"
+          }
+          Write-Host "playwright mcp up on 127.0.0.1:$env:PW_MCP_PORT"
+
+      - name: Announce endpoints
+        run: |
+          Write-Host "host:    gha-env-$env:ENV_HOST (tailnet)"
+          Write-Host "shell:   ssh -p $env:SSH_PORT $env:SSH_LOGIN_USER@gha-env-$env:ENV_HOST (PowerShell 7)"
+          Write-Host "profile: $env:PROFILE"
+          Write-Host "stop:    $env:STOP_FILE"
+          Write-Host (Get-CimInstance Win32_OperatingSystem).Caption
+
+      - name: Keep alive until TTL or stop signal
+        run: |
+          $min = 350
+          if ($env:TTL_MINUTES -match '^[0-9]+$') { $min = [int]$env:TTL_MINUTES }
+          if ($min -gt 350) { $min = 350 }
+          if ($min -lt 1) { $min = 1 }
+          $deadline = (Get-Date).AddMinutes($min)
+          Write-Host "staying up for $min minute(s); the broker ends it early via $env:STOP_FILE"
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $env:STOP_FILE) {
+              Write-Host "stop signal received; shutting down"
+              break
+            }
+            $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Host "$(Get-Date -Format o) sshd is down; restarting it"
+              Start-Service sshd -ErrorAction SilentlyContinue
+            }
+            if ($env:PROFILE -eq 'playwright') {
+              $up = (Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded
+              if (-not $up) {
+                Write-Host "$(Get-Date -Format o) playwright mcp is down; restarting it"
+                & (Join-Path $env:WORK_DIR "start-pw-mcp.ps1")
+              }
+            }
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Collect logs
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path env-logs | Out-Null
+          foreach ($f in @($env:SSHD_LOG, "C:\gha-env\pw-mcp.log", "C:\gha-env\pw-mcp.err.log")) {
+            if (Test-Path $f) { Copy-Item $f env-logs -Force -ErrorAction SilentlyContinue }
+          }
+          if (Test-Path $env:TS_EXE) {
+            & $env:TS_EXE status *> env-logs\tailscale-status.txt
+          }
+          Get-ChildItem env-logs -ErrorAction SilentlyContinue
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: env-logs-${{ inputs.env_host }}-${{ github.run_id }}
+          path: env-logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Leave the tailnet
+        if: always()
+        run: |
+          # The auth key is ephemeral, so the node also disappears by itself.
+          if (Test-Path $env:TS_EXE) { & $env:TS_EXE logout }
+          exit 0
