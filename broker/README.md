@@ -232,6 +232,36 @@ broker release. The cost is one extra call at the start of a browsing session.
   need another minute after that while Chromium finishes installing.
 - Jobs are hard-stopped by GitHub after 6 hours regardless of TTL.
 
+### Capacity
+
+Every environment holds one GitHub Actions job for the whole of its TTL, so
+the number that can be alive at once is the concurrent-job allowance of the
+account that **owns this repository**. It is not a per-token limit: adding a
+second collaborator and dispatching with their PAT draws on the same pool and
+buys nothing. Only a different owner, a larger plan or a
+[support increase](https://docs.github.com/en/actions/reference/limits) does.
+
+| Plan | Total jobs | of which macOS |
+| --- | --- | --- |
+| Free | 20 | 5 |
+| Pro | 40 | 5 |
+| Team | 60 | 5 |
+| Enterprise Cloud | 500 | 50 |
+
+Set `ACTIONS_PLAN` in `broker/.env` and the broker takes the whole allowance;
+`MAX_ENVS` and `MAX_ENVS_MACOS` override it downwards. `RESERVED_JOB_SLOTS`
+subtracts a few jobs from `MAX_ENVS` so the image build and CI keep somewhere
+to run — worth setting to 2 or 3 once environments routinely fill the plan,
+since a broker at capacity otherwise blocks the very workflow that ships its
+own next release.
+
+The macOS sub-limit is the one to remember: 5 on Free, Pro and Team alike, and
+no setting raises it. Past it GitHub queues the job instead of refusing it,
+which from the client looks like an environment that never finishes booting,
+so the broker refuses first and says which limit it hit.
+
+`GET /healthz` reports both counters: `ok live=7/20 macos=2/5`.
+
 ### Troubleshooting
 
 | Symptom | Likely cause |
