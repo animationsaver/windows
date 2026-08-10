@@ -165,7 +165,7 @@ On a host that has already joined your tailnet **in kernel mode** (verify with
 ```bash
 cd broker
 cp .env.example .env && $EDITOR .env
-docker compose up -d          # pulls ghcr.io/animationsaver/windows/broker
+docker compose up -d          # pulls $BROKER_IMAGE from broker/.env
 curl localhost:8080/healthz
 ```
 

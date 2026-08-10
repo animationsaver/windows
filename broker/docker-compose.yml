@@ -3,7 +3,7 @@ services:
     # Prebuilt by .github/workflows/broker-image.yml. Update with:
     #   docker compose pull && docker compose up -d
     # Pin a digest or a sha- tag instead of :latest if you want reproducibility.
-    image: ${BROKER_IMAGE:-ghcr.io/animationsaver/windows/broker:latest}
+    image: ${BROKER_IMAGE:?set BROKER_IMAGE in broker/.env, e.g. ghcr.io/<owner>/<repo>/broker:latest}
     # Only used by `docker compose build` / `--build`; `up` prefers the image
     # above, so a plain `docker compose up -d` never compiles anything.
     build: .
