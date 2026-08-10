@@ -90,6 +90,10 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_ACTOR: ${{ github.actor }}
+          # Optional repository variables; override the identity
+          # derived from the token below.
+          GIT_USER_NAME: ${{ vars.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.GIT_USER_EMAIL }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GH_PAT)) {
             Write-Host "::warning::GH_PAT is not set; git and gh stay unauthenticated"
@@ -102,8 +106,25 @@ jobs:
           git config --system --unset-all credential.helper 2>$null
           git config --global --unset-all credential.helper 2>$null
           git config --global credential.helper store
-          git config --global user.name "$env:GH_ACTOR"
-          git config --global user.email "$env:GH_ACTOR@users.noreply.github.com"
+          # Identity comes from the credential, not from whoever started
+          # the run: the actor and the owner of GH_PAT are frequently
+          # different accounts. Fall back to the actor for a token that
+          # /user cannot name.
+          $env:GH_TOKEN = $env:GH_PAT
+          $ghLogin = (gh api user --jq .login 2>$null)
+          $ghUid = (gh api user --jq .id 2>$null)
+          if ([string]::IsNullOrWhiteSpace($ghLogin)) { $ghLogin = $env:GH_ACTOR }
+          # id+login is the only noreply form GitHub links back to an
+          # account created after 2017-07-18.
+          if ([string]::IsNullOrWhiteSpace($ghUid)) {
+            $ghEmail = "$ghLogin@users.noreply.github.com"
+          } else {
+            $ghEmail = "$ghUid+$ghLogin@users.noreply.github.com"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:GIT_USER_NAME)) { $ghLogin = $env:GIT_USER_NAME }
+          if (-not [string]::IsNullOrWhiteSpace($env:GIT_USER_EMAIL)) { $ghEmail = $env:GIT_USER_EMAIL }
+          git config --global user.name "$ghLogin"
+          git config --global user.email "$ghEmail"
           # No BOM, LF terminated: git reads this file line by line and a UTF-8
           # BOM makes the first entry unusable.
           $utf8 = New-Object System.Text.UTF8Encoding($false)

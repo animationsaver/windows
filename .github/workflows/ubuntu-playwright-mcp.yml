@@ -62,6 +62,10 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_ACTOR: ${{ github.actor }}
+          # Optional repository variables; override the identity
+          # derived from the token below.
+          GIT_USER_NAME: ${{ vars.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.GIT_USER_EMAIL }}
         run: |
           if [ -z "$GH_PAT" ]; then
             echo "GH_PAT secret not set; skipping git credential setup"
@@ -70,8 +74,23 @@ jobs:
             # https://github.com git operation, so any SSH session as 'runner'
             # can push/pull without re-entering credentials.
             git config --global credential.helper store
-            git config --global user.name "$GH_ACTOR"
-            git config --global user.email "${GH_ACTOR}@users.noreply.github.com"
+            # Identity comes from the credential, not from whoever started
+            # the run: the actor and the owner of GH_PAT are frequently
+            # different accounts. /user answers for classic and
+            # fine-grained PATs alike; fall back to the actor for a token
+            # it cannot name (a GitHub App installation token, say).
+            GH_LOGIN=$(GH_TOKEN="$GH_PAT" gh api user --jq .login 2>/dev/null || true)
+            GH_UID=$(GH_TOKEN="$GH_PAT" gh api user --jq .id 2>/dev/null || true)
+            : "${GH_LOGIN:=$GH_ACTOR}"
+            # id+login is the only noreply form GitHub links back to an
+            # account created after 2017-07-18.
+            if [ -n "${GH_UID:-}" ]; then
+              GH_EMAIL="${GH_UID}+${GH_LOGIN}@users.noreply.github.com"
+            else
+              GH_EMAIL="${GH_LOGIN}@users.noreply.github.com"
+            fi
+            git config --global user.name "${GIT_USER_NAME:-$GH_LOGIN}"
+            git config --global user.email "${GIT_USER_EMAIL:-$GH_EMAIL}"
             printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
             chmod 600 "$HOME/.git-credentials"
             # Route any SSH-style remote (git@github.com:/ssh://) through
@@ -83,7 +102,7 @@ jobs:
             # fall back to the PAT credential helper instead of an expired token.
             git -C "$GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
             git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git" 2>/dev/null || true
-            echo "git configured for GitHub auth (user: $GH_ACTOR)"
+            echo "git configured for GitHub auth (user: $(git config --global user.name))"
           fi
 
       - name: Start PERSISTENT desktop (Xvfb + XFCE) and attach xrdp via x11vnc

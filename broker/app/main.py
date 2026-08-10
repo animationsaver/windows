@@ -135,8 +135,12 @@ def traced(fn):
 # --------------------------------------------------------------------------
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "animationsaver")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "windows")
+# Blank on purpose: resolve_repo() fills these in from the token itself, so a
+# fork only has to supply GITHUB_TOKEN. Setting them in .env still wins. A
+# hardcoded default would silently point a misconfigured deployment at a
+# repository its operator does not own.
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "ephemeral-env.yml")
 # macOS twin of the workflow above. Same contract, different runner and a
 # different SSH story (see SSH_PORT_MACOS).
@@ -430,6 +434,53 @@ def target_for(row: sqlite3.Row) -> str:
 # --------------------------------------------------------------------------
 
 
+def _gh_get(path: str) -> Any:
+    """One-shot authenticated GET against the REST API. Startup use only."""
+    resp = httpx.get(
+        API_ROOT + path,
+        timeout=15,
+        headers={
+            "Authorization": "Bearer " + GITHUB_TOKEN,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def resolve_repo() -> tuple[str, str]:
+    """Work out which repository holds the workflows.
+
+    GITHUB_OWNER/GITHUB_REPO from the environment always win. Anything left
+    blank is derived from the credential instead: /user names the account the
+    token belongs to, and a token scoped to exactly one repository names the
+    repository. Anything still unresolved is a startup error rather than a
+    guess, because a guess dispatches at somebody else's repository.
+    """
+    owner, repo = GITHUB_OWNER, GITHUB_REPO
+    if owner and repo:
+        return owner, repo
+    if not owner:
+        owner = _gh_get("/user")["login"]
+        log.info("GITHUB_OWNER unset; using the token owner %r", owner)
+    if not repo:
+        visible = [r["full_name"] for r in _gh_get("/user/repos?per_page=100")]
+        if len(visible) != 1:
+            raise SystemExit(
+                "GITHUB_REPO is unset and this token can see "
+                + str(len(visible))
+                + " repositories, so the workflow repository is ambiguous; "
+                "set GITHUB_REPO in broker/.env"
+            )
+        owner, repo = visible[0].split("/", 1)
+        log.info("GITHUB_REPO unset; using the token's only repository %r", repo)
+    return owner, repo
+
+
+GITHUB_OWNER, GITHUB_REPO = resolve_repo()
+
+
 async def dispatch_workflow(
     host_id: str,
     ttl_minutes: int,
@@ -713,11 +764,13 @@ async def require_playwright(env_id: str) -> str:
 MCP_KWARGS: dict[str, Any] = {
     "name": "gha-env-broker",
     "instructions": (
-        "Disposable Linux, macOS and Windows environments backed by GitHub "
-        "Actions runners.\n"
+        "Disposable Linux, macOS and Windows environments.\n"
         "Call create_env once per conversation, keep the returned env_id, and "
         "pass it to every other call. Environments are wiped when they expire."
         "\n\n"
+        "git and the gh CLI are already authenticated in every environment, so "
+        "clone, commit, push and gh commands against GitHub work with no "
+        "credential setup.\n\n"
         "For Xcode, Swift or anything else that needs Apple tooling, create the "
         "environment with platform='macos' (and profile='xcode' to get Xcode "
         "selected plus XcodeGen). For PowerShell, .NET or anything else that "
@@ -756,12 +809,12 @@ async def create_env(
     Returns immediately with state=provisioning; boot takes a few minutes.
     Poll wait_ready or env_status before running commands.
 
-    platform: "linux" (Ubuntu runner, the default), "macos" (macOS runner, for
-    Xcode, Swift and anything else that needs Apple tooling) or "windows"
-    (Windows Server runner; commands run in PowerShell 7 as an administrator,
-    so sudo_exec is the same call as exec). macOS boots slower and burns
-    Actions minutes at ~10x the Linux rate and Windows at ~2x, so only ask for
-    them when you actually need them.
+    platform: "linux" (Ubuntu, the default), "macos" (for Xcode, Swift and
+    anything else that needs Apple tooling) or "windows" (Windows Server;
+    commands run in PowerShell 7 as an administrator, so sudo_exec is the same
+    call as exec). macOS boots slower and costs roughly 10x as much to keep
+    alive as Linux, Windows about 2x, so only ask for them when you actually
+    need them.
 
     profile: "base" (shell only), "playwright" (shell plus a headless Chromium
     driven through browser_call) or, on macOS only, "xcode" (Xcode selected and
@@ -897,6 +950,9 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     PowerShell 7, so write PowerShell there: Get-ChildItem rather than ls, `;`
     rather than `&&`, $env:VAR rather than $VAR.
 
+    git and the gh CLI are already authenticated here, so cloning, pushing and
+    gh commands need no credential setup.
+
     Each call gets its own SSH channel, so calls may run in parallel. State
     such as the working directory is NOT carried between calls; chain with
     `cd /path && ...` (`cd C:\\path; ...` on Windows) instead. For long jobs,
@@ -917,8 +973,8 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
 async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
     """Run a shell command as root inside the environment identified by env_id.
 
-    On Windows there is nothing to elevate: the SSH session already carries
-    runneradmin's full administrator token, so this is exactly exec.
+    On Windows there is nothing to elevate: the session already carries a full
+    administrator token, so this is exactly exec.
     """
     row = await resolve(env_id)
     return await ssh_run(
@@ -936,8 +992,8 @@ async def browser_tools(env_id: str) -> list[dict[str, Any]]:
     """List the Playwright tools available in this environment.
 
     Call this once before using browser_call. The set comes from the
-    playwright-mcp release installed on the runner, so it is authoritative for
-    that environment rather than baked into this broker.
+    playwright-mcp release installed in that environment, so it is
+    authoritative for it rather than baked into this broker.
     """
     host = await require_playwright(env_id)
 
@@ -1010,7 +1066,7 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
         "state": "destroyed",
         "graceful": stopped,
         "live": live_count(),
-        "note": "the runner takes up to ~30s to notice and exit",
+        "note": "the environment takes up to ~30s to notice and exit",
     }
 
 
