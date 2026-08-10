@@ -4,7 +4,7 @@ GitHub Actions のランナー上に、**Tailscale 経由で接続できるリ�
 
 現在の主役は **Ubuntu ランナー上に Playwright MCP + SSH MCP + RDP デスクトップ**を立てるワークフローで、Notion AI のカスタム MCP から接続して使うことを想定しています。
 
-> **公開リポジトリなので GitHub Actions の分数課金は発生しません**（同時実行数・1ジョブ最大6時間の上限のみ）。
+> **公開リポジトリなので GitHub Actions の分数課金は発生しません**（Free プランの同時実行 20 ジョブ・うち macOS 5・1ジョブ最大6時間の上限のみ）。
 
 ## ワークフロー一覧
 

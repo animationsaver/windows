@@ -23,7 +23,9 @@ Design notes
   to servers listening on the tailnet with no authentication whatsoever.
 * Playwright is proxied generically (list + call) rather than mirrored tool by
   tool, so a new playwright-mcp release does not require a broker release.
-* Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table.
+* Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table, and
+  MAX_ENVS defaults to the whole Actions job allowance of the plan named by
+  ``ACTIONS_PLAN`` instead of to an arbitrary small number.
 """
 
 from __future__ import annotations
@@ -155,7 +157,46 @@ WORKFLOW_FILE_WINDOWS = os.environ.get(
 )
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
-MAX_ENVS = int(os.environ.get("MAX_ENVS", "6"))
+# GitHub caps how many Actions jobs one account may run at once, and an
+# environment holds exactly one job for the whole of its TTL, so that cap is
+# also the ceiling on live environments. It belongs to the account that OWNS
+# the repository rather than to the token that dispatched the run, so handing
+# the broker a second collaborator's PAT buys no extra capacity; only a
+# different owner, a larger plan or a support increase does.
+# https://docs.github.com/en/actions/reference/limits
+ACTIONS_PLAN_LIMITS = {
+    # plan: (total concurrent jobs, of which macOS)
+    "free": (20, 5),
+    "pro": (40, 5),
+    "team": (60, 5),
+    "enterprise": (500, 50),
+}
+ACTIONS_PLAN = os.environ.get("ACTIONS_PLAN", "free").strip().lower()
+if ACTIONS_PLAN not in ACTIONS_PLAN_LIMITS:
+    raise SystemExit(
+        "ACTIONS_PLAN must be one of "
+        + ", ".join(sorted(ACTIONS_PLAN_LIMITS))
+        + ", got "
+        + repr(ACTIONS_PLAN)
+    )
+PLAN_MAX_JOBS, PLAN_MAX_MACOS_JOBS = ACTIONS_PLAN_LIMITS[ACTIONS_PLAN]
+# Jobs held back for everything that is not an environment: the broker image
+# build, CI, a manual run. Zero hands the entire plan to environments, which is
+# the most throughput but lets a full broker starve the very workflow that
+# ships its own next release.
+RESERVED_JOB_SLOTS = max(0, int(os.environ.get("RESERVED_JOB_SLOTS", "0")))
+MAX_ENVS = int(
+    os.environ.get("MAX_ENVS", str(max(1, PLAN_MAX_JOBS - RESERVED_JOB_SLOTS)))
+)
+# macOS has a much lower sub-limit, identical on Free, Pro and Team, that no
+# value of MAX_ENVS raises: GitHub simply queues the excess until a macOS job
+# finishes, which from here looks like an environment that never boots. Cap it
+# ourselves so create_env fails fast and says why.
+MAX_ENVS_MACOS = int(
+    os.environ.get("MAX_ENVS_MACOS", str(min(PLAN_MAX_MACOS_JOBS, MAX_ENVS)))
+)
+# Windows has no sub-limit of its own, only the shared total.
+PLATFORM_CAPS = {"macos": MAX_ENVS_MACOS}
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
@@ -360,11 +401,15 @@ def reap() -> None:
         )
 
 
-def live_count() -> int:
+def live_count(platform: str | None = None) -> int:
+    """Count live environments, or only those on one platform."""
+    sql = "SELECT COUNT(*) FROM envs WHERE state IN (?, ?)"
+    params: tuple[Any, ...] = ACTIVE_STATES
+    if platform is not None:
+        sql += " AND platform = ?"
+        params = (*ACTIVE_STATES, platform)
     with db() as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM envs WHERE state IN (?, ?)", ACTIVE_STATES
-        ).fetchone()[0]
+        return conn.execute(sql, params).fetchone()[0]
 
 
 def new_host_id() -> str:
@@ -820,6 +865,11 @@ async def create_env(
     driven through browser_call) or, on macOS only, "xcode" (Xcode selected and
     XcodeGen installed). Choose it up front: neither platform nor profile can
     be changed afterwards.
+
+    Capacity is finite and shared across platforms; macOS has a much smaller
+    ceiling than Linux and Windows. list_envs shows what is running and
+    destroy_env frees a slot. When the account is full this call fails with
+    the limit it hit rather than leaving an environment queued forever.
     """
     if platform not in PLATFORMS:
         raise ValueError("platform must be one of " + ", ".join(PLATFORMS))
@@ -837,7 +887,24 @@ async def create_env(
         raise RuntimeError(
             "already running "
             + str(MAX_ENVS)
-            + " environments; destroy_env one first or raise MAX_ENVS"
+            + " environments, the whole "
+            + ACTIONS_PLAN
+            + " plan's concurrent Actions jobs; destroy_env one first, or"
+            " raise MAX_ENVS if the account owning the repository has room"
+        )
+    cap = PLATFORM_CAPS.get(platform)
+    if cap is not None and live_count(platform) >= cap:
+        raise RuntimeError(
+            "already running "
+            + str(cap)
+            + " "
+            + platform
+            + " environments; GitHub caps concurrent "
+            + platform
+            + " jobs there on the "
+            + ACTIONS_PLAN
+            + " plan whatever MAX_ENVS says, so destroy_env one of them or"
+            " ask for platform='linux'"
         )
 
     env_id = secrets.token_urlsafe(32)
@@ -1066,6 +1133,7 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
         "state": "destroyed",
         "graceful": stopped,
         "live": live_count(),
+        "max": MAX_ENVS,
         "note": "the environment takes up to ~30s to notice and exit",
     }
 
@@ -1203,7 +1271,17 @@ class BearerAuth(BaseHTTPMiddleware):
 
 async def healthz(_: Request) -> PlainTextResponse:
     reap()
-    return PlainTextResponse("ok live=" + str(live_count()) + "/" + str(MAX_ENVS) + "\n")
+    return PlainTextResponse(
+        "ok live="
+        + str(live_count())
+        + "/"
+        + str(MAX_ENVS)
+        + " macos="
+        + str(live_count("macos"))
+        + "/"
+        + str(MAX_ENVS_MACOS)
+        + "\n"
+    )
 
 
 init_db()
@@ -1221,12 +1299,14 @@ app.add_middleware(NoStandaloneStream)
 app.add_middleware(RequestLog)
 
 log.info(
-    "broker ready: repo=%s/%s tailnet=%s max_envs=%s log=%s json_response=%s "
-    "stateless=%s get_stream=%s",
+    "broker ready: repo=%s/%s tailnet=%s plan=%s max_envs=%s max_envs_macos=%s "
+    "log=%s json_response=%s stateless=%s get_stream=%s",
     GITHUB_OWNER,
     GITHUB_REPO,
     TAILNET_DOMAIN,
+    ACTIONS_PLAN,
     MAX_ENVS,
+    MAX_ENVS_MACOS,
     LOG_LEVEL,
     JSON_RESPONSE,
     STATELESS,
