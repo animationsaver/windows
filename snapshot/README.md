@@ -49,6 +49,14 @@ dockerd や tailscaled、Actions のランナーエージェントに触りた�
 exec(env_id, "#!host systemctl status docker")
 ```
 
+broker が送ってくるのは `bash -lc '<command>'` なので、マーカーを消したあとに内側の
+ログインシェルが `/etc/profile.d/envsnap.sh` を読み直す。逃げたことを `ENVSNAP_HOST=1`
+として環境変数で渡しているのはそのためで、これが無いと hook が親切に overlay へ入れ直し、
+`#!host` が無言で効かなくなる。
+
+`sudo` は環境変数を捨てるので、`#!host` の中では `sudo -n envsnap save` のようにプログラムを
+直接呼ぶこと。`sudo -n bash -lc ...` にすると overlay に戻ってしまう。
+
 ## 仕組み
 
 ### ログインシェルの差し替え
@@ -251,3 +259,10 @@ GitHub Actions の ubuntu-24.04 ランナ（4 コア / 15 GiB / 145 GB ディス
 フラグであって、明示的な `envsnap-enter` の条件にしてはいけない、が教訓です。今は
 mount の有無だけで判断し、入れないときは stderr に警告を出します。
 **「安全のための no-op」は、黄ってやると安全ではありません。**
+- `#!host` を作ったのに 2 つの hook が互いを打ち消していた。envsnap-shell がマーカーを削って
+  ホストで実行し、その内側の `bash -lc` が profile.d を読んで overlay に入り直していた。
+  broker 越しに `#!host findmnt -no FSTYPE,SOURCE /` が `ext4 /dev/root` ではなく
+  `overlay envsnap` と答えて気づいた。`ENVSNAP_HOST=1` を渡して解決。
+- warm 環境の起動が `packages.microsoft.com` の 403 Forbidden で死んだ。`apt-get update` が
+  exit 100 で終わると envsnap を入れる前に job ごと落ちるので、要らない apt list を消して
+  index 更新の失敗は致命扱いしないようにした。
