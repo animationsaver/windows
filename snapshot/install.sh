@@ -25,6 +25,7 @@ $sudo install -Dm755 "$here/envsnap"       /usr/local/sbin/envsnap
 $sudo install -Dm755 "$here/envsnap-enter" /usr/local/sbin/envsnap-enter
 $sudo install -Dm755 "$here/envsnap-shell" /usr/local/bin/envsnap-shell
 $sudo install -Dm644 "$here/exclude.txt"   /usr/local/share/envsnap/exclude.txt
+$sudo install -Dm644 "$here/profile.d-envsnap.sh" /etc/profile.d/envsnap.sh
 $sudo mkdir -p /run/envsnap
 
 echo "envsnap installed:"
@@ -32,3 +33,4 @@ echo "  /usr/local/sbin/envsnap"
 echo "  /usr/local/sbin/envsnap-enter"
 echo "  /usr/local/bin/envsnap-shell"
 echo "  /usr/local/share/envsnap/exclude.txt"
+echo "  /etc/profile.d/envsnap.sh"

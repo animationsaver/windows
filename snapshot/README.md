@@ -58,6 +58,21 @@ Tailscale SSH はセッションごとにアカウントのログインシェル
 中に着地します。`sudo_exec` も同じで、chroot が先に効くので `sudo` は overlay の
 中の root になります（ホストの root にはなりません）。
 
+ただしログインシェルの差し替えだけでは足りません。Tailscale SSH は **接続を確立した
+時点で** `--login-shell` を解決して保持し、broker は SSH 接続を使い回すので、`chsh`
+より前に張られた接続はその後もずっと `/bin/bash` を起動し続けます。実際、中から
+`ps` を取ると `tailscaled be-child ssh --login-shell=/bin/bash ... --cmd=bash -lc …`
+が見えます。warm-env.yml は tailscaled を起動する **前に** mount と activate を
+済ませるので本番ではこの順序問題は起きませんが、正しさを順序に依存させないために
+`/etc/profile.d/envsnap.sh` にも同じ処理を置いています。broker が送るのは
+`bash -lc '<command>'` で、その内側のログインシェルは必ず `/etc/profile.d/*.sh` を
+読むため、接続がいつ張られていても overlay に入れます。
+
+このフックは条件を全部満たしたときだけ発動します（`/run/envsnap/active` がある・
+`envsnap-enter` が実行可能・`merged` がマウント済み・まだ中に入っていない）。
+どれか欠ければ普通のシェルとして振る舞うので、設定を間違えても SSH できなく
+なることはありません。
+
 ### レイヤと世代
 
 保存は**差分レイヤの積み重ね**です。前回保存時のファイル一覧（パス・種別・サイズ・
