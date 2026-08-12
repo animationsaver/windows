@@ -115,8 +115,18 @@ jobs:
 
       - name: Install base packages
         run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq zstd acl attr
+          # packages.microsoft.com intermittently answers 403 on the Azure
+          # runners, and one broken third-party list takes the whole
+          # apt-get update down with it (exit 100). That killed a boot before
+          # envsnap was even installed, so drop the lists we do not need and
+          # treat a failed index refresh as non-fatal: jq/zstd/acl/attr come
+          # from the Ubuntu archive and are usually already in the image.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list || true
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y -qq \
+            || sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y -qq \
+            || echo 'apt-get update failed twice; continuing with the cached index'
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq zstd acl attr
 
       - name: Setup Node.js (profile=playwright)
         if: inputs.profile == 'playwright'

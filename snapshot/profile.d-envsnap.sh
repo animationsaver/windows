@@ -13,6 +13,7 @@
 
 [ -n "${BASH_VERSION:-}" ] || return 0          # dash に読まれても壊れないように
 [ -z "${ENVSNAP_INSIDE:-}" ] || return 0        # すでに中
+[ -z "${ENVSNAP_HOST:-}" ] || return 0          # '#!host' でホストに出た先。入り直さない
 [ -f /run/envsnap/active ] || return 0          # activate されていない
 [ -x /usr/local/sbin/envsnap-enter ] || return 0
 mountpoint -q "${ENVSNAP_ROOT:-/mnt/envsnap}/merged" 2>/dev/null || return 0
@@ -30,7 +31,9 @@ case "${BASH_EXECUTION_STRING:-}" in
     # 逃げ道: コマンドのどこかに '#!host' を入れると overlay に入らずホストで実行する。
     # broker は bash -lc '<command>' の形で送ってくるので前方一致では拾えないし、
     # 残したままにすると bash が以降をコメント扱いして無言で何もしないので取り除く。
-    exec /bin/bash -c "${BASH_EXECUTION_STRING/'#!host'/}"
+    # 取り除くと内側のログインシェルからは目印が消えるので、ENVSNAP_HOST=1 で
+    # 「もう逃がした」ことを環境変数として渡し、この hook が入り直すのを防ぐ。
+    exec env ENVSNAP_HOST=1 /bin/bash -c "${BASH_EXECUTION_STRING/'#!host'/}"
     ;;
   ?*)
     __envsnap_enter /bin/bash -lc "$BASH_EXECUTION_STRING"

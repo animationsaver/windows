@@ -10,8 +10,9 @@ set -uo pipefail
 ENVSNAP_ROOT=${ENVSNAP_ROOT:-/mnt/envsnap}
 MERGED=$ENVSNAP_ROOT/merged
 
-# Already inside, or the overlay is not active: behave like plain bash.
-if [ -n "${ENVSNAP_INSIDE:-}" ] || [ ! -f /run/envsnap/active ] || ! mountpoint -q "$MERGED"; then
+# Already inside, already escaped to the host, or the overlay is not active:
+# behave like plain bash.
+if [ -n "${ENVSNAP_INSIDE:-}" ] || [ -n "${ENVSNAP_HOST:-}" ] || [ ! -f /run/envsnap/active ] || ! mountpoint -q "$MERGED"; then
 	exec /bin/bash "$@"
 fi
 
@@ -20,9 +21,18 @@ fi
 # Actions agent. Matched anywhere rather than only at the start because the
 # broker hands us `bash -lc '<command>'`, so the user's own text is already
 # one layer inside a quoted string by the time we see it.
+#
+# ENVSNAP_HOST=1 is what makes the escape stick. The marker has to be removed
+# (bash would treat the rest of the line as a comment and silently do nothing),
+# but that means the login shell the broker starts inside the escaped command
+# no longer sees '#!host' when it sources /etc/profile.d/envsnap.sh -- and that
+# hook would helpfully chroot us back into the overlay. The variable tells it
+# the escape was already honoured. Note that sudo drops it, so inside a
+# '#!host' command call programs directly (sudo -n envsnap save) rather than
+# through another login shell.
 cmd=${2:-}
 if [ "${1:-}" = "-c" ] && [ "$cmd" != "${cmd/'#!host'/}" ]; then
-	exec /bin/bash -c "${cmd/'#!host'/}" "${@:3}"
+	exec env ENVSNAP_HOST=1 /bin/bash -c "${cmd/'#!host'/}" "${@:3}"
 fi
 
 exec sudo -n /usr/local/sbin/envsnap-enter /bin/bash "$@"
