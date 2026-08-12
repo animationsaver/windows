@@ -121,8 +121,11 @@ jobs:
           # envsnap was even installed, so drop the lists we do not need and
           # treat a failed index refresh as non-fatal: jq/zstd/acl/attr come
           # from the Ubuntu archive and are usually already in the image.
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-                     /etc/apt/sources.list.d/azure-cli.list || true
+          # The image ships that repo as azure-cli.list on some generations and
+          # as deb822 azure-cli.sources on others, so match the URL, not the
+          # file name.
+          sudo grep -rlE 'packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null \
+            | xargs -r sudo rm -f || true
           sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y -qq \
             || sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update -y -qq \
             || echo 'apt-get update failed twice; continuing with the cached index'
