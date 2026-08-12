@@ -202,6 +202,8 @@ bearer token, and list that same hostname in `BROKER_PUBLIC_HOSTS`.
 | `env_status(env_id)` | `provisioning` / `ready` plus expiry. |
 | `exec(env_id, command, timeout_seconds)` | Run a command as `runner`. |
 | `sudo_exec(env_id, command, timeout_seconds)` | Run a command as root. |
+| `exec_start(env_id, command, sudo)` | Start a command in the background; returns a `job_id` at once. |
+| `exec_poll(job_id, tail_lines)` | State, exit code and log tail of a detached job. |
 | `browser_tools(env_id)` | List the Playwright tools this environment offers, with their schemas. |
 | `browser_call(env_id, tool, arguments)` | Invoke one of them. Screenshots come back as images. |
 | `destroy_env(env_id)` | Stop the runner and free capacity. |
@@ -223,9 +225,25 @@ broker release. The cost is one extra call at the start of a browsing session.
   `cd /path && ...`.
 - Browser state does persist: `browser_call` talks to one long-lived Chromium
   for the life of the environment.
+- The calls that block -- `exec`, `sudo_exec`, `wait_ready`, `browser_call`
+  -- are capped by `SYNC_EXEC_MAX_SECONDS`, 50s by default. The cap tracks the
+  *client*, not this server: an MCP client abandons a request on its own
+  schedule and never says so, so a longer call would throw away the result of
+  a command that actually succeeded. Notion'"'"'s was measured at about 60s (55s
+  answered, 75s did not) while the same 150s request went through fine over
+  plain `curl`. Above the cap the broker refuses with an error that says where
+  to go instead of starting undeliverable work.
+- `wait_ready` is capped the same way, so a `provisioning` answer during a
+  2-5 minute boot is normal and simply means call it again.
+- Anything longer belongs in `exec_start`, which detaches the job on the
+  environment and returns a `job_id` immediately, and `exec_poll`, which
+  reports state, exit code and the tail of the log. The output is written to a
+  file on the environment rather than held in the broker, so a broker restart,
+  a dropped SSH connection or a client that simply stops polling all cost
+  nothing, and polling never consumes what it reads.
 - On timeout the broker closes that channel only. Nothing is `pkill`ed, so
-  unrelated processes are never caught in the blast radius. For anything long,
-  detach anyway: `nohup ... > /tmp/job.log 2>&1 &`.
+  unrelated processes are never caught in the blast radius. A detached job is
+  untouched either way; kill a runaway one with an ordinary short `exec`.
 - A dead pooled connection, and the Playwright tunnel riding on it, are
   retried once transparently.
 - `wait_ready` reports readiness of the shell. On `playwright` the browser may
@@ -268,6 +286,8 @@ so the broker refuses first and says which limit it hit.
 | --- | --- |
 | `421 Misdirected Request` | `BROKER_PUBLIC_HOSTS` does not list the hostname the client uses |
 | `401 unauthorized` from the broker | `BROKER_TOKEN` mismatch between `.env` and the MCP client |
+| `MCP error -32001: Request timed out`, command still running | The client'"'"'s own timeout, not the broker'"'"'s. Move the work to `exec_start`/`exec_poll` |
+| `timeout_seconds=... is above the ...s ceiling` | Working as intended. Use `exec_start`/`exec_poll`, or raise `SYNC_EXEC_MAX_SECONDS` for a client known to wait longer |
 | `ssh to ... failed: Permission denied` | Tailscale ACL does not grant `ssh` from the broker host to the environment, or `users` omits `runner` |
 | `ssh to ... failed` hangs then times out | ACL uses check mode (`checkPeriod`), which cannot work non-interactively |
 | `could not reach Playwright MCP` | Environment is on `profile='base'`, or Chromium is still installing — check `env-logs-*` artifact for `pw-mcp.log` |
