@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# envsnap - overlayfs の upperdir を「差分レイヤ」として保存 / 復元し、
+# 使い捨ての GitHub Actions ランナーに前回の環境をそのまま展開する。
+#
+#   lowerdir = ランナーイメージの / (read-only bind)
+#   upperdir = このセッションで変更されたものだけ = スナップショットの中身
+#   merged   = 実際に作業するルート (chroot 先)
+#
+# upperdir はディスク上 (ext4) なので容量は RAM ではなくディスクに依存する。
+set -euo pipefail
+
+ENVSNAP_ROOT="${ENVSNAP_ROOT:-/mnt/envsnap}"
+LOWER="$ENVSNAP_ROOT/lower"
+UPPER="$ENVSNAP_ROOT/upper"
+WORK="$ENVSNAP_ROOT/work"
+MERGED="$ENVSNAP_ROOT/merged"
+STATE="$ENVSNAP_ROOT/state"
+CACHE="$ENVSNAP_ROOT/cache"
+RUNSTATE=/run/envsnap
+
+NAME="${ENVSNAP_NAME:-default}"
+REMOTE="${ENVSNAP_REMOTE:-}"
+PASSPHRASE="${ENVSNAP_PASSPHRASE:-}"
+ZL="${ENVSNAP_ZSTD_LEVEL:-6}"
+MAX_LAYERS="${ENVSNAP_MAX_LAYERS:-8}"
+USER_NAME="${ENVSNAP_USER:-runner}"
+EXCLUDE_FILE="${ENVSNAP_EXCLUDE_FILE:-/usr/local/share/envsnap/exclude.txt}"
+SHELL_WRAPPER=/usr/local/bin/envsnap-shell
+
+log() { printf '[envsnap] %s\n' "$*" >&2; }
+die() { printf '[envsnap] ERROR: %s\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "root で実行してください (sudo envsnap ...)"; }
+have_remote() { [ -n "$REMOTE" ]; }
+rd() { printf '%s/%s' "${REMOTE%/}" "$NAME"; }
+
+# ランナーイメージが違うと lowerdir が変わるので、差分の前提が崩れる。
+# 完全一致を強制はしないが、記録して警告を出す。
+image_id() {
+  local ver="unknown"
+  if [ -f /imagegeneration/imagedata.json ]; then
+    ver=$(grep -o 'Version: [0-9.]*' /imagegeneration/imagedata.json | head -1 | cut -d' ' -f2)
+  fi
+  printf '%s/%s/%s' "$(. /etc/os-release && echo "$ID$VERSION_ID")" "$(uname -m)" "$ver"
+}
+
+enc_filter() {
+  if [ -n "$PASSPHRASE" ]; then
+    ENVSNAP_PASSPHRASE="$PASSPHRASE" openssl enc -aes-256-ctr -pbkdf2 -iter 200000 -salt -pass env:ENVSNAP_PASSPHRASE
+  else
+    cat
+  fi
+}
+dec_filter() {
+  if [ -n "$PASSPHRASE" ]; then
+    ENVSNAP_PASSPHRASE="$PASSPHRASE" openssl enc -d -aes-256-ctr -pbkdf2 -iter 200000 -pass env:ENVSNAP_PASSPHRASE
+  else
+    cat
+  fi
+}
+layer_ext() { if [ -n "$PASSPHRASE" ]; then echo "tar.zst.enc"; else echo "tar.zst"; fi; }
+
+# upperdir の全エントリを "相対パス \t 種別 \t サイズ \t mtime(秒)" で並べた索引。
+# tar 復元後も値が変わらないよう mtime は秒に丸める。
+index_write() {
+  find "$UPPER" -mindepth 1 -printf '%P\t%y\t%s\t%Ts\n' 2>/dev/null | LC_ALL=C sort > "$1"
+}
+
+
+# ------------------------------------------------------------------ restore
+apply_layer() {
+  local f="$1" plain="$CACHE/.apply.tar"
+  dec_filter < "$f" | zstd -dc > "$plain"
+  # 前回までのレイヤに存在したが削除されたパスを先に落とす
+  if tar -xO --occurrence=1 -f "$plain" .envsnap/deleted.lst > "$CACHE/.deleted.lst" 2>/dev/null; then
+    local p
+    while IFS= read -r p; do
+      [ -n "$p" ] && rm -rf -- "${UPPER:?}/${p:?}"
+    done < "$CACHE/.deleted.lst"
+  fi
+  tar --extract --preserve-permissions --numeric-owner --xattrs --xattrs-include='*' --acls \
+      --exclude='.envsnap' --exclude='.envsnap/*' -f "$plain" -C "$UPPER"
+  rm -f "$plain" "$CACHE/.deleted.lst"
+}
+
+fetch_manifest() {
+  mkdir -p "$CACHE"
+  have_remote || return 1
+  rclone cat "$(rd)/manifest.json" > "$CACHE/manifest.json" 2>/dev/null || return 1
+  [ -s "$CACHE/manifest.json" ] || return 1
+  jq -e . "$CACHE/manifest.json" > /dev/null 2>&1 || return 1
+}
+
+cmd_restore() {
+  need_root
+  mkdir -p "$UPPER" "$CACHE"
+  if ! have_remote; then log "ENVSNAP_REMOTE 未設定: 素のランナーで起動します"; return 0; fi
+  if ! fetch_manifest; then log "スナップショット '$NAME' は未作成です (初回起動)"; return 0; fi
+  local img n i id sha ext want
+  img=$(jq -r '.image // "?"' "$CACHE/manifest.json")
+  want=$(image_id)
+  if [ "$img" != "$want" ]; then
+    log "WARN: イメージ不一致 snapshot='$img' runner='$want'"
+    log "WARN: lowerdir が違うためパッケージの二重化等が起き得ます。問題が出たら --full で取り直してください"
+  fi
+  n=$(jq -r '.layers | length' "$CACHE/manifest.json")
+  log "スナップショット '$NAME' を展開中 (layers=$n)"
+  for i in $(seq 0 $((n - 1))); do
+    id=$(jq -r ".layers[$i].id" "$CACHE/manifest.json")
+    sha=$(jq -r ".layers[$i].sha256" "$CACHE/manifest.json")
+    ext=$(jq -r ".layers[$i].ext // \"tar.zst\"" "$CACHE/manifest.json")
+    log "  layer $((i + 1))/$n: $id"
+    rclone copyto "$(rd)/layers/$id.$ext" "$CACHE/$id.$ext" --transfers 4 --checkers 8 --retries 3 -q
+    if [ "$(sha256sum "$CACHE/$id.$ext" | cut -d' ' -f1)" != "$sha" ]; then
+      die "layer $id の sha256 が一致しません (破損 / パスフレーズ違い)"
+    fi
+    apply_layer "$CACHE/$id.$ext"
+    rm -f "$CACHE/$id.$ext"
+  done
+  log "展開完了 ($(du -sh "$UPPER" | cut -f1))"
+}
+
+# -------------------------------------------------------------------- mount
+cmd_mount() {
+  need_root
+  if mountpoint -q "$MERGED"; then log "すでにマウント済み"; return 0; fi
+  grep -q overlay /proc/filesystems || die "overlayfs が使えません"
+  mkdir -p "$LOWER" "$UPPER" "$WORK" "$MERGED" "$STATE" "$CACHE" "$RUNSTATE"
+  cmd_restore
+  mount --bind / "$LOWER"
+  mount -o remount,ro,bind "$LOWER"
+  mount -t overlay envsnap -o "lowerdir=$LOWER,upperdir=$UPPER,workdir=$WORK" "$MERGED"
+  local d
+  for d in proc sys dev run; do
+    mkdir -p "$MERGED/$d"
+    mount --rbind "/$d" "$MERGED/$d"
+  done
+  # スナップショット置き場自体は中から見えないようにする (再帰の防止)
+  mkdir -p "$MERGED$ENVSNAP_ROOT"
+  mount -t tmpfs -o size=4m,mode=0755 envsnap-hide "$MERGED$ENVSNAP_ROOT" || true
+  index_write "$STATE/base.idx"
+  : > "$RUNSTATE/active"
+  log "overlay をマウントしました: $MERGED (upper=$UPPER)"
+}
+
+cmd_umount() {
+  need_root
+  rm -f "$RUNSTATE/active"
+  deactivate_shell || true
+  if mountpoint -q "$MERGED"; then umount -R "$MERGED" || umount -Rl "$MERGED" || true; fi
+  if mountpoint -q "$LOWER"; then umount "$LOWER" || umount -l "$LOWER" || true; fi
+  log "unmounted"
+}
+
+# --------------------------------------------------------------------- save
+cmd_save() {
+  need_root
+  local full=0
+  [ "${1:-}" = "--full" ] && full=1
+  mountpoint -q "$MERGED" || die "overlay がマウントされていません"
+  if ! have_remote; then log "ENVSNAP_REMOTE 未設定: 保存をスキップ"; return 0; fi
+  sync
+  mkdir -p "$STATE/meta/.envsnap" "$CACHE"
+  fetch_manifest || echo '{"schema":1,"layers":[]}' > "$CACHE/manifest.json"
+  local have; have=$(jq -r '.layers | length' "$CACHE/manifest.json")
+  if [ "$have" -ge "$MAX_LAYERS" ]; then
+    log "layer が $have 個になったので full で圧縮し直します"
+    full=1
+  fi
+  [ -f "$STATE/base.idx" ] || full=1
+  index_write "$STATE/cur.idx"
+  local list="$STATE/changed.lst" raw="$STATE/changed.raw" del="$STATE/meta/.envsnap/deleted.lst"
+  if [ "$full" -eq 1 ]; then
+    cut -f1 "$STATE/cur.idx" > "$raw"
+    : > "$del"
+  else
+    LC_ALL=C comm -23 "$STATE/cur.idx" "$STATE/base.idx" | cut -f1 > "$raw"
+    LC_ALL=C comm -23 <(cut -f1 "$STATE/base.idx") <(cut -f1 "$STATE/cur.idx") > "$del"
+  fi
+  # 変更ファイルの親ディレクトリも tar に含めて権限を保つ
+  awk '{ n = split($0, a, "/"); acc = ""; for (i = 1; i < n; i++) { acc = (i == 1 ? a[1] : acc "/" a[i]); print acc } print $0 }' "$raw" \
+    | LC_ALL=C sort -u > "$list"
+  local nchanged ndel
+  nchanged=$(wc -l < "$list"); ndel=$(wc -l < "$del")
+  if [ "$nchanged" -eq 0 ] && [ "$ndel" -eq 0 ]; then
+    log "変更なし: 保存をスキップ"
+    return 0
+  fi
+  local id ext blob
+  id="$(date -u +%Y%m%dT%H%M%SZ)-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  ext=$(layer_ext)
+  blob="$CACHE/$id.$ext"
+  log "layer を作成中: mode=$([ "$full" -eq 1 ] && echo full || echo incremental) entries=$nchanged deleted=$ndel"
+  set +e
+  tar --create --no-recursion --numeric-owner --xattrs --xattrs-include='*' --acls --sparse \
+      --warning=no-file-changed --warning=no-file-removed --ignore-failed-read \
+      --exclude-from="$EXCLUDE_FILE" \
+      -C "$STATE/meta" .envsnap .envsnap/deleted.lst \
+      -C "$UPPER" -T "$list" 2> "$CACHE/tar.err" \
+    | zstd -"$ZL" -T0 -c | enc_filter > "$blob"
+  local rcs=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${rcs[0]}" -gt 1 ] || [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
+    sed -n '1,20p' "$CACHE/tar.err" >&2 || true
+    die "layer の作成に失敗 (tar=${rcs[0]} zstd=${rcs[1]} enc=${rcs[2]})"
+  fi
+  local size sha
+  size=$(stat -c%s "$blob"); sha=$(sha256sum "$blob" | cut -d' ' -f1)
+  log "upload: $(numfmt --to=iec "$size") -> $(rd)/layers/$id.$ext"
+  rclone copyto "$blob" "$(rd)/layers/$id.$ext" --transfers 4 --retries 3 -q
+  local mf="$CACHE/manifest.new.json" base="$CACHE/manifest.json"
+  [ "$full" -eq 1 ] && echo '{"schema":1,"layers":[]}' > "$base"
+  jq --arg name "$NAME" --arg img "$(image_id)" --arg now "$(date -uIs)" \
+     --arg id "$id" --arg sha "$sha" --arg ext "$ext" \
+     --argjson size "$size" --argjson nch "$nchanged" --argjson nd "$ndel" \
+     --arg mode "$([ "$full" -eq 1 ] && echo full || echo incremental)" \
+     '.schema = 1 | .name = $name | .image = $img | .updated = $now
+      | .created = (.created // $now)
+      | .layers += [{id: $id, ext: $ext, sha256: $sha, size: $size, entries: $nch, deleted: $nd, mode: $mode, created: $now}]' \
+     "$base" > "$mf"
+  rclone copyto "$mf" "$(rd)/manifest.json" --retries 3 -q
+  mv "$mf" "$base"
+  if [ "$full" -eq 1 ]; then
+    rclone delete "$(rd)/layers" --exclude "/$id.$ext" -q || true
+  fi
+  rm -f "$blob"
+  mv "$STATE/cur.idx" "$STATE/base.idx"
+  log "保存完了: $id"
+}
+
+cmd_status() {
+  echo "name        : $NAME"
+  echo "remote      : ${REMOTE:-(none)}"
+  echo "image       : $(image_id)"
+  echo "encrypted   : $([ -n "$PASSPHRASE" ] && echo yes || echo no)"
+  if mountpoint -q "$MERGED"; then
+    echo "overlay     : mounted at $MERGED"
+    echo "upper size  : $(du -sh "$UPPER" 2>/dev/null | cut -f1)"
+    echo "disk free   : $(df -h --output=avail "$UPPER" | tail -1 | tr -d ' ')"
+  else
+    echo "overlay     : not mounted"
+  fi
+  echo "login shell : $(getent passwd "$USER_NAME" | cut -d: -f7)"
+  if fetch_manifest; then
+    echo "layers      : $(jq -r '.layers | length' "$CACHE/manifest.json") ($(jq -r '[.layers[].size] | add // 0' "$CACHE/manifest.json" | numfmt --to=iec) on remote)"
+    jq -r '.layers[] | "  - \(.id)  \(.mode)  \(.size)B  entries=\(.entries)  deleted=\(.deleted)"' "$CACHE/manifest.json"
+  else
+    echo "layers      : (no snapshot yet)"
+  fi
+}
+
+# ------------------------------------------------------- login shell 切り替え
+activate_shell() {
+  need_root
+  [ -x "$SHELL_WRAPPER" ] || die "$SHELL_WRAPPER がありません (install.sh を実行)"
+  grep -qx "$SHELL_WRAPPER" /etc/shells || echo "$SHELL_WRAPPER" >> /etc/shells
+  chsh -s "$SHELL_WRAPPER" "$USER_NAME"
+  log "$USER_NAME のログインシェルを $SHELL_WRAPPER に変更 (以後の SSH は overlay 内に入ります)"
+}
+deactivate_shell() {
+  need_root
+  if [ "$(getent passwd "$USER_NAME" | cut -d: -f7)" = "$SHELL_WRAPPER" ]; then
+    chsh -s /bin/bash "$USER_NAME"
+    log "ログインシェルを /bin/bash に戻しました"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+usage: envsnap <command>
+  mount        スナップショットを展開して overlay をマウント
+  activate     runner のログインシェルを overlay 入りラッパーに切替
+  deactivate   ログインシェルを元に戻す
+  save [--full]  差分を layer として保存 (--full で全体を 1 layer に圧縮)
+  restore      (mount が内部で呼ぶ) スナップショットを upperdir に展開
+  status       状態表示
+  umount       overlay を外す
+USAGE
+}
+
+case "${1:-}" in
+  mount)      cmd_mount ;;
+  restore)    cmd_restore ;;
+  save)       shift; cmd_save "${1:-}" ;;
+  status)     cmd_status ;;
+  umount)     cmd_umount ;;
+  activate)   activate_shell ;;
+  deactivate) deactivate_shell ;;
+  *)          usage; exit 1 ;;
+esac

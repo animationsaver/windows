@@ -1,0 +1,28 @@
+# envsnap が layer に入れないもの (tar --exclude-from, upperdir からの相対パス)
+# --- 採っても意味がない / 毎回変わるもの ---
+proc/*
+sys/*
+dev/*
+run/*
+tmp/*
+var/tmp/*
+var/log/*
+var/cache/apt/archives/*
+var/lib/apt/lists/*
+var/lib/systemd/*
+var/lib/private/*
+swapfile
+# --- 入れ子防止 ---
+mnt/envsnap
+mnt/envsnap/*
+# --- ホスト固有 / 毎回発行される資格情報 (持ち越すと危険) ---
+var/lib/tailscale/*
+etc/ssh/ssh_host_*
+home/*/.ssh/authorized_keys
+root/.ssh/authorized_keys
+home/*/.git-credentials
+home/*/.config/gh/hosts.yml
+home/*/.docker/config.json
+# --- デーモンがホスト側で動いているので chroot 内に持っていっても使えない ---
+var/lib/docker/*
+var/lib/containerd/*

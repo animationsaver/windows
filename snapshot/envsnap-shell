@@ -1,0 +1,22 @@
+#!/bin/bash
+# runner のログインシェル。Tailscale SSH 経由の全セッションを overlay の中に入れる。
+# broker は `bash -lc '<cmd>'` を送ってくるので、引数は一切解釈せずそのまま渡す。
+set -u
+ROOT="${ENVSNAP_ROOT:-/mnt/envsnap}"
+STATE=/run/envsnap/active
+
+# fail-open: overlay が無い / 壊れているときは普通の bash として振る舞う
+# (これがないとミスったときに環境へ SSH できなくなる)
+if [ -n "${ENVSNAP_INSIDE:-}" ] || [ ! -e "$STATE" ] || [ ! -d "$ROOT/merged/usr" ]; then
+  exec /bin/bash "$@"
+fi
+
+# 逃げ道: `#!host <cmd>` で始めると overlay に入らずホスト側で実行する
+if [ "${1:-}" = "-c" ] && [ "${2:-}" != "${2#'#!host '}" ]; then
+  exec /bin/bash -c "${2#'#!host '}"
+fi
+
+if [ -x /usr/local/sbin/envsnap-enter ] && sudo -n true 2>/dev/null; then
+  exec sudo -n /usr/local/sbin/envsnap-enter "$@"
+fi
+exec /bin/bash "$@"
