@@ -1,0 +1,284 @@
+name: Warm MCP Env (broker-managed, snapshotted)
+
+# The warm twin of ephemeral-env.yml.
+#
+# Same runner, same Tailscale SSH contract, same broker. The one difference is
+# that the shell does not live on the runner's root filesystem: it lives in an
+# overlayfs whose upper layer is restored from a snapshot on boot and pushed
+# back to that snapshot on shutdown. Packages, dotfiles and caches therefore
+# survive from one environment to the next, while the box underneath stays a
+# stock, disposable GitHub-hosted runner.
+#
+# ephemeral-env.yml is left completely untouched: anything that wants a clean
+# machine keeps using it.
+#
+# Storage lives in the assets of a single GitHub Release in a private
+# repository (default: <owner>/gha-env-snapshots). Release assets are capped
+# at 2 GiB per file and 1000 per release, with no cap on the total, so envsnap
+# splits every layer into chunks and uploads them in parallel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_host:
+        description: "Random lowercase id from the broker. Becomes the Tailscale hostname gha-env-<env_host>."
+        required: true
+      ttl_minutes:
+        description: "Minutes to keep the environment alive (job hard-stops at 6h anyway)"
+        required: false
+        default: "350"
+      profile:
+        description: "base = shell only | playwright = shell + Playwright MCP"
+        required: false
+        default: "base"
+      snapshot:
+        description: "Snapshot name to resume from and save back to. Independent snapshots never see each other."
+        required: false
+        default: "default"
+      snapshot_save:
+        description: "Save the environment back to the snapshot on shutdown (true/false)"
+        required: false
+        default: "true"
+      snapshot_full:
+        description: "Write one full layer instead of an incremental one (true/false)"
+        required: false
+        default: "false"
+      autosave_minutes:
+        description: "Also save every N minutes while running. 0 disables it. Insurance against the 6h hard kill."
+        required: false
+        default: "0"
+
+concurrency:
+  group: gha-env-${{ inputs.env_host }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ENV_HOST: ${{ inputs.env_host }}
+      PROFILE: ${{ inputs.profile }}
+      TTL_MINUTES: ${{ inputs.ttl_minutes }}
+      PW_MCP_PORT: "8931"
+      ENVSNAP_NAME: ${{ inputs.snapshot }}
+      ENVSNAP_GH_REPO: ${{ vars.ENVSNAP_GH_REPO || format('{0}/gha-env-snapshots', github.repository_owner) }}
+      AUTOSAVE_MINUTES: ${{ inputs.autosave_minutes }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if ! printf '%s' "$ENV_HOST" | grep -Eq '^[a-z0-9]{8,32}$'; then
+            echo "::error::env_host must be 8-32 lowercase alphanumeric characters"
+            exit 1
+          fi
+          if ! printf '%s' "$ENVSNAP_NAME" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
+            echo "::error::snapshot name must match ^[a-z0-9][a-z0-9._-]{0,63}$"
+            exit 1
+          fi
+          echo "hostname will be gha-env-$ENV_HOST, snapshot '$ENVSNAP_NAME' in $ENVSNAP_GH_REPO"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git and gh to authenticate to GitHub via PAT (for SSH sessions)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_ACTOR: ${{ github.actor }}
+          GIT_USER_NAME: ${{ vars.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.GIT_USER_EMAIL }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT is required by this workflow: it is the credential used to read and write the snapshot store"
+            exit 1
+          fi
+          git config --global credential.helper store
+          GH_LOGIN=$(GH_TOKEN="$GH_PAT" gh api user --jq .login 2>/dev/null || true)
+          GH_UID=$(GH_TOKEN="$GH_PAT" gh api user --jq .id 2>/dev/null || true)
+          : "${GH_LOGIN:=$GH_ACTOR}"
+          if [ -n "${GH_UID:-}" ]; then
+            GH_EMAIL="${GH_UID}+${GH_LOGIN}@users.noreply.github.com"
+          else
+            GH_EMAIL="${GH_LOGIN}@users.noreply.github.com"
+          fi
+          git config --global user.name "${GIT_USER_NAME:-$GH_LOGIN}"
+          git config --global user.email "${GIT_USER_EMAIL:-$GH_EMAIL}"
+          printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
+          chmod 600 "$HOME/.git-credentials"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git -C "$GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git" 2>/dev/null || true
+          printf '%s' "$GH_PAT" | gh auth login --hostname github.com --git-protocol https --with-token \
+            && echo "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo unknown)" \
+            || echo "::warning::gh auth login failed"
+
+      - name: Install base packages
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq zstd acl attr
+
+      - name: Setup Node.js (profile=playwright)
+        if: inputs.profile == 'playwright'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Playwright is installed on the host, i.e. into the overlay's LOWER
+      # layer, on purpose: it is part of the machine, it is identical on every
+      # run, and keeping it out of the snapshot keeps the diff small.
+      - name: Install Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: |
+          npm install -g @playwright/mcp@latest
+          npx playwright install --with-deps chromium
+
+      - name: Install envsnap
+        run: sudo -n ./snapshot/install.sh
+
+      - name: Restore snapshot and mount the overlay
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ENVSNAP_PASSPHRASE: ${{ secrets.ENVSNAP_PASSPHRASE }}
+        run: |
+          sudo -n env GH_TOKEN="$GH_TOKEN" ENVSNAP_PASSPHRASE="$ENVSNAP_PASSPHRASE" \
+            ENVSNAP_NAME="$ENVSNAP_NAME" ENVSNAP_GH_REPO="$ENVSNAP_GH_REPO" \
+            /usr/local/sbin/envsnap mount
+          # From here on every SSH session (and every sudo inside one) lands in
+          # the overlay instead of on the runner's own root filesystem.
+          sudo -n /usr/local/sbin/envsnap activate
+          sudo -n env ENVSNAP_NAME="$ENVSNAP_NAME" ENVSNAP_GH_REPO="$ENVSNAP_GH_REPO" \
+            /usr/local/sbin/envsnap status
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start tailscaled (userspace networking)
+        run: |
+          sudo setsid tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+            --statedir=/var/lib/tailscale < /dev/null > /tmp/tailscaled.log 2>&1 &
+          sleep 5
+
+      - name: Join tailnet as gha-env-<env_host>
+        run: |
+          sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
+            --hostname="gha-env-$ENV_HOST" --ssh --accept-routes
+          sleep 3
+          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "TS_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "tailnet host: $HOST"
+          case "$HOST" in
+            gha-env-$ENV_HOST.*) ;;
+            *) echo "::error::hostname collision (got $HOST, expected gha-env-$ENV_HOST.*)"; exit 1 ;;
+          esac
+
+      - name: Verify Tailscale SSH is accepting
+        run: |
+          for i in $(seq 1 15); do
+            if tailscale status --json | jq -e '.Self.Capabilities // [] | index("ssh")' > /dev/null 2>&1; then
+              echo "tailscale ssh advertised"; break
+            fi
+            sleep 2
+          done
+          tailscale status || true
+
+      - name: Start Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: |
+          sudo tee /usr/local/bin/start-pw-mcp.sh > /dev/null <<EOS
+          #!/usr/bin/env bash
+          setsid npx @playwright/mcp@latest --port "${PW_MCP_PORT}" --host 127.0.0.1 --headless \
+            --allowed-hosts '*' \
+            < /dev/null >> /tmp/pw-mcp.log 2>&1 &
+          EOS
+          sudo chmod +x /usr/local/bin/start-pw-mcp.sh
+          /usr/local/bin/start-pw-mcp.sh
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp"; then
+              echo "playwright mcp up on 127.0.0.1:$PW_MCP_PORT"; break
+            fi
+            sleep 2
+          done
+
+      - name: Announce endpoints
+        run: |
+          echo "=================================================="
+          echo "  Shell          : ssh runner@$TS_HOST   (lands inside snapshot '$ENVSNAP_NAME')"
+          echo "  Playwright MCP : 127.0.0.1:$PW_MCP_PORT via SSH forward (profile=playwright)"
+          echo "  Snapshot store : $ENVSNAP_GH_REPO, release snap-$ENVSNAP_NAME"
+          echo "  Host escape    : prefix a command with '#!host' to run it outside the overlay"
+          echo "=================================================="
+
+      - name: Keep alive
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ENVSNAP_PASSPHRASE: ${{ secrets.ENVSNAP_PASSPHRASE }}
+        run: |
+          snap_save() {
+            echo "$(date -Is) saving snapshot..."
+            sudo -n env GH_TOKEN="$GH_TOKEN" ENVSNAP_PASSPHRASE="$ENVSNAP_PASSPHRASE" \
+              ENVSNAP_NAME="$ENVSNAP_NAME" ENVSNAP_GH_REPO="$ENVSNAP_GH_REPO" \
+              /usr/local/sbin/envsnap save || echo "::warning::snapshot save failed"
+          }
+          MIN="${TTL_MINUTES:-350}"
+          case "$MIN" in ''|*[!0-9]*) MIN=350;; esac
+          [ "$MIN" -le 0 ] && MIN=350
+          [ "$MIN" -gt 350 ] && MIN=350
+          AUTO="${AUTOSAVE_MINUTES:-0}"
+          case "$AUTO" in ''|*[!0-9]*) AUTO=0;; esac
+          echo "holding environment for $MIN minutes (autosave every ${AUTO}m; 0 = off)"
+          END=$(( $(date +%s) + MIN * 60 ))
+          NEXT=$(( $(date +%s) + AUTO * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            # /tmp is shared with the overlay, so the broker's `touch
+            # /tmp/stop.txt` over SSH lands on this very file.
+            if [ -f /tmp/stop.txt ]; then echo "stop.txt detected -- shutting down"; break; fi
+            if [ -f /tmp/snapshot-now ]; then sudo -n rm -f /tmp/snapshot-now; snap_save; fi
+            if [ "$AUTO" -gt 0 ] && [ "$(date +%s)" -ge "$NEXT" ]; then
+              snap_save; NEXT=$(( $(date +%s) + AUTO * 60 ))
+            fi
+            if ! tailscale status > /dev/null 2>&1; then
+              echo "$(date -Is) tailscaled is not responding"
+            fi
+            if [ "$PROFILE" = "playwright" ]; then
+              curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:$PW_MCP_PORT/mcp" \
+                || { echo "$(date -Is) playwright mcp is down, restarting"; /usr/local/bin/start-pw-mcp.sh; }
+            fi
+            sleep 30
+          done
+
+      - name: Save snapshot
+        if: always() && inputs.snapshot_save != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ENVSNAP_PASSPHRASE: ${{ secrets.ENVSNAP_PASSPHRASE }}
+          FULL: ${{ inputs.snapshot_full }}
+        run: |
+          ARGS=""
+          [ "$FULL" = "true" ] && ARGS="--full"
+          sudo -n env GH_TOKEN="$GH_TOKEN" ENVSNAP_PASSPHRASE="$ENVSNAP_PASSPHRASE" \
+            ENVSNAP_NAME="$ENVSNAP_NAME" ENVSNAP_GH_REPO="$ENVSNAP_GH_REPO" \
+            /usr/local/sbin/envsnap save $ARGS || echo "::warning::final snapshot save failed"
+          sudo -n /usr/local/sbin/envsnap deactivate || true
+          sudo -n /usr/local/sbin/envsnap umount || true
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p env-logs
+          for f in /tmp/pw-mcp.log /tmp/tailscaled.log; do
+            [ -f "$f" ] && cp "$f" env-logs/ || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warm-env-logs-${{ inputs.env_host }}-${{ github.run_id }}
+          path: env-logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: sudo tailscale logout || true

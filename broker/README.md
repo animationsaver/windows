@@ -58,6 +58,44 @@ a public repository.
 **Ephemeral Tailscale nodes.** Devices deregister themselves when the job ends,
 so there is no cleanup step that could delete a sibling environment by mistake.
 
+## Warm environments
+
+`create_env(platform="linux-warm")` dispatches `.github/workflows/warm-env.yml`
+onto the same `ubuntu-latest` runner as `platform="linux"`. What differs is what
+the shell sees: the environment lives in an overlayfs whose upper layer is
+restored from a snapshot when the box boots and pushed back to it when the box
+shuts down, so packages you install and files you write are still there in the
+next environment.
+
+```
+create_env(platform="linux-warm")                # resume the "default" snapshot
+create_env(platform="linux-warm", snapshot="ml") # a separate, independent one
+snapshot_env(env_id)                             # checkpoint without stopping
+```
+
+`exec`, `sudo_exec` and the browser tools behave exactly as they do on `linux`.
+The login shell is what does the chrooting, so the broker itself needed no new
+plumbing beyond the platform table. Prefixing a command with `#!host` runs it on
+the runner itself, outside the overlay, which is how you reach dockerd,
+tailscaled or the Actions agent.
+
+Snapshots live in the assets of a single GitHub Release in a private repository
+(`ENVSNAP_GH_REPO`, default `<owner>/gha-env-snapshots`) and are encrypted with
+`ENVSNAP_PASSPHRASE`. Release assets are capped at 2 GiB each and 1000 per
+release, with no cap on the total, so each layer is split into 256 MiB chunks
+and uploaded four at a time: 52 MiB/s measured, against 16 MiB/s for a single
+stream.
+
+Two things to know before relying on it:
+
+- Boot takes 3-6 minutes rather than 2-5, because the snapshot comes down first.
+- When GitHub rolls a new runner image, the snapshot is refused rather than
+  grafted onto a different base: the environment starts empty and says so.
+  `ENVSNAP_FORCE=1` in the workflow overrides that.
+
+`snapshot/README.md` covers the on-disk format, the exclusion list and the
+tuning variables.
+
 ## macOS environments
 
 `create_env(platform="macos")` dispatches `.github/workflows/ephemeral-env-macos.yml`
@@ -193,11 +231,28 @@ This is the one and only public entry point. Connect Notion to
 `https://<broker-host>.<tailnet>.ts.net/mcp` with the `BROKER_TOKEN` as a
 bearer token, and list that same hostname in `BROKER_PUBLIC_HOSTS`.
 
+### 5. Snapshot store (warm environments only)
+
+`platform="linux-warm"` needs somewhere to keep its snapshots and a key to
+encrypt them with:
+
+- Create a **private** repository for them, e.g. `<you>/gha-env-snapshots`.
+  Leave immutable releases switched off: envsnap prunes superseded chunks, and
+  immutability would block both that and every later upload.
+- Add an `ENVSNAP_PASSPHRASE` secret (a long random string) to the repository
+  that runs the workflows.
+- `GH_PAT` needs the `repo` scope so the workflow can read and write releases in
+  that private repository. A classic PAT with `repo` covers it.
+- Set the `ENVSNAP_GH_REPO` repository variable if the store is not
+  `<owner>/gha-env-snapshots`.
+
+None of this is needed for `platform="linux"`, `"macos"` or `"windows"`.
+
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `create_env(ttl_minutes, profile, label)` | Provision a box; returns the secret `env_id`. Returns immediately — boot takes 2–5 minutes. |
+| `create_env(ttl_minutes, profile, label)` | Provision a box; returns the secret `env_id`. `platform="linux-warm"` resumes a snapshot instead of starting clean. Returns immediately — boot takes 2–5 minutes. |
 | `wait_ready(env_id, max_wait_seconds)` | Poll until the box answers. |
 | `env_status(env_id)` | `provisioning` / `ready` plus expiry. |
 | `exec(env_id, command, timeout_seconds)` | Run a command as `runner`. |
@@ -205,6 +260,7 @@ bearer token, and list that same hostname in `BROKER_PUBLIC_HOSTS`.
 | `browser_tools(env_id)` | List the Playwright tools this environment offers, with their schemas. |
 | `browser_call(env_id, tool, arguments)` | Invoke one of them. Screenshots come back as images. |
 | `destroy_env(env_id)` | Stop the runner and free capacity. |
+| `snapshot_env(env_id)` | Save a `linux-warm` environment to its snapshot without stopping it. |
 | `list_envs()` | Live environments, with `env_id` masked. |
 
 Profiles: `base` (shell only) or `playwright` (adds headless Chromium). The

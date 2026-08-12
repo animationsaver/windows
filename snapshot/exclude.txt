@@ -1,28 +1,62 @@
-# envsnap が layer に入れないもの (tar --exclude-from, upperdir からの相対パス)
-# --- 採っても意味がない / 毎回変わるもの ---
+# tar --exclude-from patterns, relative to the overlay upper directory.
+# GNU tar globs match across '/', so 'var/log/*' covers the whole subtree.
+
+# --- host identity: restoring these onto a different runner breaks it ------
+etc/hostname
+etc/hosts
+etc/machine-id
+etc/resolv.conf
+etc/ssh/ssh_host_*
+var/lib/tailscale
+var/lib/tailscale/*
+var/lib/dhcp/*
+var/lib/systemd/random-seed
+
+# --- credentials: never ship these to an artifact store --------------------
+home/runner/.git-credentials
+home/runner/.config/gh
+home/runner/.config/gh/*
+home/runner/.ssh
+home/runner/.ssh/*
+home/runner/.aws/*
+home/runner/.docker/config.json
+root/.config/gh/*
+root/.ssh/*
+
+# --- volatile or virtual ---------------------------------------------------
+proc
 proc/*
+sys
 sys/*
+dev
 dev/*
+run
 run/*
+tmp
 tmp/*
+mnt
+mnt/*
+media/*
 var/tmp/*
 var/log/*
-var/cache/apt/archives/*
-var/lib/apt/lists/*
-var/lib/systemd/*
-var/lib/private/*
+var/run/*
+var/lock/*
 swapfile
-# --- 入れ子防止 ---
-mnt/envsnap
-mnt/envsnap/*
-# --- ホスト固有 / 毎回発行される資格情報 (持ち越すと危険) ---
-var/lib/tailscale/*
-etc/ssh/ssh_host_*
-home/*/.ssh/authorized_keys
-root/.ssh/authorized_keys
-home/*/.git-credentials
-home/*/.config/gh/hosts.yml
-home/*/.docker/config.json
-# --- デーモンがホスト側で動いているので chroot 内に持っていっても使えない ---
+swap.img
+
+# --- futile: state owned by daemons that live outside the overlay ----------
+var/lib/docker
 var/lib/docker/*
 var/lib/containerd/*
+var/lib/lxcfs/*
+
+# --- pure caches that cost more to ship than to rebuild --------------------
+var/cache/apt/archives/*
+var/cache/man/*
+home/runner/.npm/_logs/*
+home/runner/.cache/ms-playwright/*.zip
+
+# --- the runner agent and its per-job workspace ----------------------------
+home/runner/runners/*
+home/runner/work/_temp/*
+home/runner/work/_actions/*

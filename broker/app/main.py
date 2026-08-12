@@ -35,6 +35,7 @@ import functools
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import sqlite3
@@ -155,6 +156,11 @@ WORKFLOW_FILE_MACOS = os.environ.get(
 WORKFLOW_FILE_WINDOWS = os.environ.get(
     "WORKFLOW_FILE_WINDOWS", "ephemeral-env-windows.yml"
 )
+# Warm twin of the Linux workflow: identical contract and runner, but the
+# shell lives in an overlayfs that is restored from a snapshot on boot and
+# pushed back on shutdown, so the next environment starts where the last
+# one stopped instead of rebuilding itself from scratch.
+WORKFLOW_FILE_WARM = os.environ.get("WORKFLOW_FILE_WARM", "warm-env.yml")
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
 # GitHub caps how many Actions jobs one account may run at once, and an
@@ -257,11 +263,15 @@ PUBLIC_HOSTS = [
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
-PLATFORMS = ("linux", "macos", "windows")
+PLATFORMS = ("linux", "linux-warm", "macos", "windows")
+# Platforms that carry their state between runs. Only these accept a
+# snapshot name, and only these take a minute or two to shut down.
+SNAPSHOT_PLATFORMS = ("linux-warm",)
 # Which profiles each platform knows how to build. "xcode" only means anything
 # on a macOS runner.
 PROFILES = {
     "linux": ("base", "playwright"),
+    "linux-warm": ("base", "playwright"),
     "macos": ("base", "playwright", "xcode"),
     "windows": ("base", "playwright"),
 }
@@ -272,21 +282,28 @@ KEY_AUTH_PLATFORMS = ("macos", "windows")
 # another if/else in every call site.
 WORKFLOW_FILES = {
     "linux": WORKFLOW_FILE,
+    "linux-warm": WORKFLOW_FILE_WARM,
     "macos": WORKFLOW_FILE_MACOS,
     "windows": WORKFLOW_FILE_WINDOWS,
 }
 SSH_PORTS = {
     "linux": SSH_PORT,
+    "linux-warm": SSH_PORT,
     "macos": SSH_PORT_MACOS,
     "windows": SSH_PORT_WINDOWS,
 }
 SSH_USERS = {
     "linux": SSH_USER,
+    "linux-warm": SSH_USER,
     "macos": SSH_USER,
     "windows": SSH_USER_WINDOWS,
 }
 BOOT_NOTES = {
     "linux": "Boot usually takes 2-5 minutes",
+    "linux-warm": (
+        "Boot usually takes 3-6 minutes: the snapshot is restored before"
+        " the shell opens"
+    ),
     "macos": "Boot usually takes 4-8 minutes on macOS",
     "windows": "Boot usually takes 3-6 minutes on Windows",
 }
@@ -823,6 +840,11 @@ MCP_KWARGS: dict[str, Any] = {
         "PowerShell 7 as an administrator, so write PowerShell syntax and use "
         "exec for elevated commands too. exec, sudo_exec and destroy_env "
         "behave identically on all three platforms.\n\n"
+        "platform='linux-warm' is that same Ubuntu box with a memory: it "
+        "restores an overlayfs snapshot on boot and saves it back on shutdown, "
+        "so packages you install and files you write are still there in the "
+        "next environment. Pass snapshot='<name>' to keep independent "
+        "snapshots apart, and snapshot_env to checkpoint mid-session.\n\n"
         "For browser automation, create the environment with "
         "profile='playwright', then call browser_tools(env_id) once to see the "
         "available Playwright tools and their arguments, and browser_call to "
@@ -848,6 +870,7 @@ async def create_env(
     profile: str = "base",
     label: str = "",
     platform: str = "linux",
+    snapshot: str = "",
 ) -> dict[str, Any]:
     """Provision a fresh disposable environment and return its secret env_id.
 
@@ -866,6 +889,15 @@ async def create_env(
     XcodeGen installed). Choose it up front: neither platform nor profile can
     be changed afterwards.
 
+    platform="linux-warm" is the same Ubuntu runner as "linux" except that
+    the shell lives in an overlayfs which is restored from a snapshot when
+    the environment boots and saved back when it shuts down, so packages
+    you install and files you write are still there next time. snapshot
+    picks which one to resume (default "default"); two names never see each
+    other's changes. snapshot_env checkpoints one mid-session. Everything
+    else -- exec, sudo_exec, the browser tools -- behaves as it does on
+    "linux".
+
     Capacity is finite and shared across platforms; macOS has a much smaller
     ceiling than Linux and Windows. list_envs shows what is running and
     destroy_env frees a slot. When the account is full this call fails with
@@ -880,6 +912,15 @@ async def create_env(
             + "' must be one of "
             + ", ".join(PROFILES[platform])
         )
+    if snapshot and platform not in SNAPSHOT_PLATFORMS:
+        raise ValueError(
+            "snapshot only means something on platform='linux-warm'; every"
+            " other platform is wiped when it shuts down"
+        )
+    # Becomes a release tag on the store side, so keep it to the characters
+    # a git ref and an asset name can both survive.
+    snapshot_name = re.sub(r"[^a-z0-9._-]+", "-", (snapshot or "default").lower())
+    snapshot_name = snapshot_name.strip("-.")[:64] or "default"
     ttl_minutes = max(1, min(int(ttl_minutes), 350))
 
     reap()
@@ -946,6 +987,14 @@ async def create_env(
                 workflow_file=WORKFLOW_FILES[platform],
                 extra_inputs={"ssh_pubkey": pubkey or ""},
             )
+        elif platform in SNAPSHOT_PLATFORMS:
+            await dispatch_workflow(
+                host_id,
+                ttl_minutes,
+                profile,
+                workflow_file=WORKFLOW_FILES[platform],
+                extra_inputs={"snapshot": snapshot_name},
+            )
         else:
             await dispatch_workflow(host_id, ttl_minutes, profile)
     except Exception:
@@ -958,6 +1007,7 @@ async def create_env(
         "host": host_for(host_id),
         "platform": platform,
         "profile": profile,
+        "snapshot": snapshot_name if platform in SNAPSHOT_PLATFORMS else None,
         "state": "provisioning",
         "expires_at": iso(expires),
         "note": "Keep env_id secret; it is the only credential for this box. "
@@ -1108,6 +1158,40 @@ async def browser_call(
 
 @mcp.tool()
 @traced
+async def snapshot_env(env_id: str) -> dict[str, Any]:
+    """Checkpoint a warm environment to its snapshot without shutting it down.
+
+    Only valid on platform="linux-warm". destroy_env and the TTL expiry save
+    as well, so this is for locking in a long install part-way through a
+    session, or before something risky.
+    """
+    row = await resolve(env_id)
+    platform = platform_of(row)
+    if platform not in SNAPSHOT_PLATFORMS:
+        raise ValueError(
+            "this environment is on platform='"
+            + platform
+            + "', which keeps no snapshot; create one with"
+            " platform='linux-warm'"
+        )
+    # Handing the job to the workflow's keep-alive loop rather than running
+    # it here means the save outlives this SSH channel -- and that a save
+    # already in flight is not started twice.
+    await ssh_run(
+        target_for(row),
+        "touch /tmp/snapshot-now",
+        timeout=30,
+        platform=platform,
+    )
+    return {
+        "state": row["state"],
+        "snapshot": "requested",
+        "note": "the save begins within 30s and runs in the background",
+    }
+
+
+@mcp.tool()
+@traced
 async def destroy_env(env_id: str) -> dict[str, Any]:
     """Shut the environment down now and free up capacity."""
     row = await resolve(env_id)
@@ -1134,7 +1218,12 @@ async def destroy_env(env_id: str) -> dict[str, Any]:
         "graceful": stopped,
         "live": live_count(),
         "max": MAX_ENVS,
-        "note": "the environment takes up to ~30s to notice and exit",
+        "note": (
+            "the environment takes up to ~30s to notice, then saves its"
+            " snapshot before exiting, so allow a minute or two"
+            if platform in SNAPSHOT_PLATFORMS
+            else "the environment takes up to ~30s to notice and exit"
+        ),
     }
 
 
