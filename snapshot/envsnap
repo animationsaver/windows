@@ -71,6 +71,26 @@ image_id() {
 enc() { if [ -n "$ENVSNAP_PASSPHRASE" ]; then openssl enc -aes-256-ctr -pbkdf2 -iter 200000 -pass env:ENVSNAP_PASSPHRASE; else cat; fi; }
 dec() { if [ -n "$ENVSNAP_PASSPHRASE" ]; then openssl enc -d -aes-256-ctr -pbkdf2 -iter 200000 -pass env:ENVSNAP_PASSPHRASE; else cat; fi; }
 
+# GitHub refuses a release asset of 2 GiB or more, and one release holds at
+# most 1000 of them. A chunk size at or above the asset limit would therefore
+# build a layer that can never be uploaded -- and we would only find that out
+# after compressing and encrypting the whole thing. Clamp rather than die:
+# losing a snapshot to a config typo is worse than shipping smaller chunks.
+ASSET_MAX_MB=1900
+
+chunk_mb() {
+	local mb=${ENVSNAP_CHUNK_MB}
+	case $mb in
+		''|*[!0-9]*) log "ENVSNAP_CHUNK_MB='$mb' is not a number; using 256"; mb=256 ;;
+	esac
+	if [ "$mb" -lt 1 ]; then log "ENVSNAP_CHUNK_MB=$mb is too small; using 256"; mb=256; fi
+	if [ "$ENVSNAP_STORE" = ghrelease ] && [ "$mb" -gt "$ASSET_MAX_MB" ]; then
+		log "ENVSNAP_CHUNK_MB=$mb is over GitHub's per-asset limit; capping at $ASSET_MAX_MB MiB"
+		mb=$ASSET_MAX_MB
+	fi
+	printf '%s' "$mb"
+}
+
 # --------------------------------------------------------------------------
 # store
 # --------------------------------------------------------------------------
@@ -301,7 +321,7 @@ cmd_save() {
 	if [ -n "$ENVSNAP_PASSPHRASE" ]; then ext=tar.zst.enc; fi
 	mode=incremental
 	if [ "$full" = 1 ]; then mode=full; fi
-	chunk=$((ENVSNAP_CHUNK_MB * 1024 * 1024))
+	chunk=$(( $(chunk_mb) * 1024 * 1024 ))
 	rm -rf "${CACHE:?}/up"; mkdir -p "$CACHE/up"
 	file=$CACHE/$id.$ext
 
@@ -311,6 +331,17 @@ cmd_save() {
 	local sha size parts
 	sha=$(sha256sum "$file" | cut -d' ' -f1)
 	size=$(stat -c %s "$file")
+	# split -a 3 stops at 999 pieces, and a release holds 1000 assets anyway,
+	# so a chunk size that is too small for this layer has to grow. Raising it
+	# beats refusing: the work is already on disk and nothing is uploaded yet.
+	# (Checked here rather than after split, which dies on its 1000th piece
+	# with "output file suffixes exhausted" and no hint about what to change.)
+	if [ $(( (size + chunk - 1) / chunk )) -gt 999 ]; then
+		local grown=$(( size / 999 / 1048576 + 1 ))
+		[ "$grown" -le "$ASSET_MAX_MB" ] || die "layer is $((size / 1048576)) MiB, which needs more than the 1000 assets one release holds even at $ASSET_MAX_MB MiB per chunk"
+		log "raising the chunk size to $grown MiB: $((size / 1048576)) MiB does not fit in 999 chunks of $((chunk / 1048576)) MiB"
+		chunk=$((grown * 1024 * 1024))
+	fi
 	split -b "$chunk" -a 3 -d "$file" "$CACHE/up/$id.$ext.p"
 	parts=$(find "$CACHE/up" -name "$id.$ext.p*" | wc -l)
 	if [ -s "$del" ]; then cp "$del" "$CACHE/up/$id.del"; fi
@@ -444,7 +475,7 @@ cmd_status() {
 	esac
 	printf '\n'
 	printf 'encryption  : %s\n' "$([ -n "$ENVSNAP_PASSPHRASE" ] && echo 'aes-256-ctr' || echo 'off')"
-	printf 'chunk size  : %s MiB, %s parallel workers\n' "$ENVSNAP_CHUNK_MB" "$ENVSNAP_JOBS"
+	printf 'chunk size  : %s MiB, %s parallel workers\n' "$(chunk_mb)" "$ENVSNAP_JOBS"
 	if mountpoint -q "$MERGED"; then
 		printf 'mounted     : yes (%s)\n' "$MERGED"
 		printf 'upper size  : %s\n' "$(du -sh "$UPPER" 2>/dev/null | cut -f1)"
