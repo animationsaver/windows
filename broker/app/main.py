@@ -26,11 +26,18 @@ Design notes
 * Capacity is capped by ``MAX_ENVS`` rather than by a fixed slot table, and
   MAX_ENVS defaults to the whole Actions job allowance of the plan named by
   ``ACTIONS_PLAN`` instead of to an arbitrary small number.
+* Work that outlives an MCP client's own request timeout runs through
+  ``exec_start``/``exec_poll``, which detach the job on the environment and
+  leave the broker holding nothing but a row, so neither a broker restart nor
+  a dropped connection can lose a result. Synchronous ``exec`` is capped below
+  that client ceiling rather than advertising timeouts the transport will
+  never deliver.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
 import logging
@@ -206,6 +213,17 @@ PLATFORM_CAPS = {"macos": MAX_ENVS_MACOS}
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_MINUTES", "350"))
 BROKER_TOKEN = os.environ.get("BROKER_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/broker.sqlite3")
+
+# Ceiling on a synchronous exec, and it is not this server's limit. An MCP
+# client abandons a request on its own schedule and never tells the server, so
+# past that point the command keeps running with nobody left to hand the result
+# to. Notion's client was measured at roughly 60s: 55s came back, 75s did not,
+# while the same 150s request answered fine when made with curl. Refusing above
+# the ceiling is more honest than starting work whose output is already
+# undeliverable; exec_start/exec_poll is the way to run anything longer.
+SYNC_EXEC_MAX_SECONDS = max(5, int(os.environ.get("SYNC_EXEC_MAX_SECONDS", "50")))
+# Default number of trailing log lines exec_poll returns.
+JOB_TAIL_LINES = max(1, int(os.environ.get("JOB_TAIL_LINES", "200")))
 
 # Transport shape. Defaults chosen for the simplest possible client:
 #   JSON_RESPONSE=1  POST /mcp answers with one application/json body rather
@@ -407,6 +425,22 @@ def init_db() -> None:
         ):
             if column not in have:
                 conn.execute("ALTER TABLE envs ADD COLUMN " + column + " " + decl)
+        # Detached jobs. No output is stored here on purpose: a job's stdout
+        # lives in a file on the environment, so a broker restart loses
+        # nothing and a chatty command cannot bloat this database.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id     TEXT PRIMARY KEY,
+                env_id     TEXT NOT NULL,
+                command    TEXT NOT NULL,
+                sudo       INTEGER NOT NULL DEFAULT 0,
+                workdir    TEXT NOT NULL,
+                started_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_env ON jobs(env_id)")
 
 
 def reap() -> None:
@@ -693,8 +727,8 @@ async def ssh_run(
                     raise ExecTimeout(
                         "command timed out after "
                         + str(timeout)
-                        + "s and was terminated; for long jobs detach with "
-                        "`nohup ... > /tmp/job.log 2>&1 &` and poll the log"
+                        + "s and was terminated; run anything this long with "
+                        "exec_start and follow it with exec_poll instead"
                     )
                 status = proc.exit_status
             out = (stdout or "") + (stderr or "")
@@ -740,6 +774,164 @@ async def resolve(env_id: str) -> sqlite3.Row:
     if row["state"] not in ACTIVE_STATES:
         raise ValueError("environment is " + row["state"] + "; create a new one")
     return row
+
+
+# --------------------------------------------------------------------------
+# detached jobs
+# --------------------------------------------------------------------------
+
+# Sentinels the poll snippet prints around its answer. Deliberately unlikely
+# strings: a job whose own output contains the word "done" must not be able to
+# pass for a finished job.
+JOB_STATE_MARK = "__JOB_STATE__"
+JOB_OUTPUT_MARK = "__JOB_OUTPUT__"
+
+
+def sync_timeout(timeout_seconds: Any, tool: str) -> int:
+    """Validate a synchronous tool's timeout against the MCP client ceiling.
+
+    Coerces before comparing: FastMCP passes on whatever JSON the client sent,
+    and at least one client sends timeout_seconds as a string, which used to
+    reach int() unguarded and fail with a message that explained nothing.
+    """
+    try:
+        requested = int(timeout_seconds)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "timeout_seconds must be a whole number of seconds, got "
+            + repr(timeout_seconds)
+        )
+    if requested > SYNC_EXEC_MAX_SECONDS:
+        raise ValueError(
+            "timeout_seconds="
+            + str(requested)
+            + " is above the "
+            + str(SYNC_EXEC_MAX_SECONDS)
+            + "s ceiling for "
+            + tool
+            + "; MCP clients abandon a request on their own schedule (Notion's"
+            " at about 60s) without telling the server, which loses the result"
+            " of a command that in fact succeeded. Use exec_start and then"
+            " exec_poll for anything longer, or raise SYNC_EXEC_MAX_SECONDS if"
+            " this client is known to wait longer."
+        )
+    return max(1, requested)
+
+
+def job_dir(platform: str, job_id: str) -> str:
+    """Directory holding one job's script, log, pid and exit code."""
+    if platform == "windows":
+        return "$env:TEMP\\gha-job-" + job_id
+    return "/tmp/gha-job-" + job_id
+
+
+def start_script(platform: str, job_id: str, command: str) -> str:
+    """Snippet that detaches `command` and returns immediately.
+
+    The command travels base64-encoded and is decoded into a file on the far
+    side. Interpolating it into the snippet instead would mean quoting user
+    input for two shells at once, which works right up until somebody's
+    command contains a quote.
+
+    Backgrounded output goes to the log file rather than to the SSH channel,
+    so the channel reaches EOF at once and this call returns while the job
+    keeps running.
+    """
+    d = job_dir(platform, job_id)
+    blob = base64.b64encode(command.encode()).decode()
+    if platform == "windows":
+        # The wrapper exists so $LASTEXITCODE is the command's own status and
+        # not Start-Process's, and it is written the same way for the same
+        # quoting reason.
+        wrapper = (
+            '$d = "' + d + '"\r\n'
+            '& pwsh -NoProfile -File "$d\\cmd.ps1" *> "$d\\out.log"\r\n'
+            '$LASTEXITCODE | Set-Content "$d\\rc"\r\n'
+        )
+        wrap_blob = base64.b64encode(wrapper.encode()).decode()
+        return (
+            '$d = "' + d + '"; '
+            "New-Item -ItemType Directory -Force -Path $d | Out-Null; "
+            '[IO.File]::WriteAllBytes("$d\\cmd.ps1", '
+            "[Convert]::FromBase64String('" + blob + "')); "
+            '[IO.File]::WriteAllBytes("$d\\wrap.ps1", '
+            "[Convert]::FromBase64String('" + wrap_blob + "')); "
+            "$p = Start-Process pwsh -ArgumentList '-NoProfile','-File',"
+            '"$d\\wrap.ps1" -WindowStyle Hidden -PassThru; '
+            '$p.Id | Set-Content "$d\\pid"; '
+            "Write-Output started"
+        )
+    # setsid is Linux-only, so nohup with stdin detached is what both Linux
+    # and macOS get. macOS ships the BSD base64, whose decode flag is -D.
+    decode = "base64 -D" if platform == "macos" else "base64 -d"
+    return (
+        "d=" + shlex.quote(d) + '; mkdir -p "$d"; '
+        "printf %s " + shlex.quote(blob) + " | " + decode + ' > "$d/cmd.sh"; '
+        "nohup bash -c 'bash -l \"$0/cmd.sh\" > \"$0/out.log\" 2>&1; "
+        "echo $? > \"$0/rc\"' \"$d\" >/dev/null 2>&1 </dev/null & "
+        'echo $! > "$d/pid"; echo started'
+    )
+
+
+def poll_script(platform: str, job_id: str, tail_lines: int) -> str:
+    """Snippet that reports a job's state and the tail of its output."""
+    d = job_dir(platform, job_id)
+    n = str(tail_lines)
+    if platform == "windows":
+        return (
+            '$d = "' + d + '"; '
+            "if (-not (Test-Path $d)) { Write-Output '"
+            + JOB_STATE_MARK
+            + " missing - 0'; exit 0 }; "
+            'if (Test-Path "$d\\rc") { $st = \'done\'; '
+            '$rc = (Get-Content "$d\\rc" -Raw).Trim() } '
+            "else { $st = 'running'; $rc = '-' }; "
+            '$sz = 0; if (Test-Path "$d\\out.log") '
+            '{ $sz = (Get-Item "$d\\out.log").Length }; '
+            'Write-Output "' + JOB_STATE_MARK + ' $st $rc $sz"; '
+            "Write-Output '" + JOB_OUTPUT_MARK + "'; "
+            'if (Test-Path "$d\\out.log") '
+            '{ Get-Content "$d\\out.log" -Tail ' + n + " }"
+        )
+    return (
+        "d=" + shlex.quote(d) + "; "
+        'if [ ! -d "$d" ]; then echo "' + JOB_STATE_MARK + ' missing - 0"; '
+        "exit 0; fi; "
+        'if [ -f "$d/rc" ]; then st=done; rc=$(tr -d "[:space:]" < "$d/rc"); '
+        "else st=running; rc=-; fi; "
+        'sz=$(wc -c < "$d/out.log" 2>/dev/null || echo 0); '
+        'echo "' + JOB_STATE_MARK + ' $st ${rc:--} $sz"; '
+        'echo "' + JOB_OUTPUT_MARK + '"; '
+        "tail -n " + n + ' "$d/out.log" 2>/dev/null || true'
+    )
+
+
+def parse_poll(raw: str) -> dict[str, Any]:
+    """Split the poll snippet's output into state, exit code and log tail."""
+    state, rc_text, size, output = "unknown", "-", 0, ""
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(JOB_STATE_MARK):
+            parts = line.split()
+            if len(parts) >= 4:
+                state, rc_text = parts[1], parts[2]
+                size = int(parts[3]) if parts[3].isdigit() else 0
+        elif line.strip() == JOB_OUTPUT_MARK:
+            output = "\n".join(lines[i + 1 :])
+            break
+    return {
+        "state": state,
+        "exit_code": int(rc_text) if rc_text.lstrip("-").isdigit() else None,
+        "output_bytes": size,
+        "output": output,
+    }
+
+
+def get_job(job_id: str) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
 
 
 # --------------------------------------------------------------------------
@@ -845,6 +1037,11 @@ MCP_KWARGS: dict[str, Any] = {
         "so packages you install and files you write are still there in the "
         "next environment. Pass snapshot='<name>' to keep independent "
         "snapshots apart, and snapshot_env to checkpoint mid-session.\n\n"
+        "Anything that might run longer than about a minute belongs "
+        "in exec_start, which returns a job_id at once, and "
+        "exec_poll, which reports whether it finished and hands back "
+        "its output. A synchronous exec is capped below the point "
+        "where MCP clients give up waiting.\n\n"
         "For browser automation, create the environment with "
         "profile='playwright', then call browser_tools(env_id) once to see the "
         "available Playwright tools and their arguments, and browser_call to "
@@ -1042,13 +1239,17 @@ async def env_status(env_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 @traced
-async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]:
+async def wait_ready(env_id: str, max_wait_seconds: int = 45) -> dict[str, Any]:
     """Block until the environment answers, or until max_wait_seconds passes.
 
     Readiness means the shell answers. On profile='playwright' the browser may
     need another minute or two after that; browser_call will say so.
+
+    Waiting here blocks a request exactly as exec does, so it is capped at
+    SYNC_EXEC_MAX_SECONDS. Boots routinely take longer than one call may wait:
+    a "provisioning" answer is normal and simply means call again.
     """
-    max_wait_seconds = max(5, min(int(max_wait_seconds), 240))
+    max_wait_seconds = max(5, min(int(max_wait_seconds), SYNC_EXEC_MAX_SECONDS))
     deadline = now() + timedelta(seconds=max_wait_seconds)
     while now() < deadline:
         status = await env_status(env_id)
@@ -1060,7 +1261,7 @@ async def wait_ready(env_id: str, max_wait_seconds: int = 120) -> dict[str, Any]
 
 @mcp.tool()
 @traced
-async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
+async def exec(env_id: str, command: str, timeout_seconds: int = 45) -> str:
     """Run a shell command inside the environment identified by env_id.
 
     Linux and macOS environments run it in bash. Windows environments run it in
@@ -1072,35 +1273,150 @@ async def exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
 
     Each call gets its own SSH channel, so calls may run in parallel. State
     such as the working directory is NOT carried between calls; chain with
-    `cd /path && ...` (`cd C:\\path; ...` on Windows) instead. For long jobs,
-    detach with `nohup ... > /tmp/job.log 2>&1 &` (Start-Process or Start-Job
-    on Windows) and poll the log.
+    `cd /path && ...` (`cd C:\\path; ...` on Windows) instead.
+
+    This call is synchronous and so is capped at SYNC_EXEC_MAX_SECONDS, which
+    sits below the point where MCP clients abandon a request (about 60s for
+    Notion's). Use exec_start and exec_poll for anything longer: they detach
+    the job on the environment, so neither a client timeout nor a reconnect
+    can lose the result.
     """
+    timeout = sync_timeout(timeout_seconds, "exec")
     row = await resolve(env_id)
     return await ssh_run(
         target_for(row),
         command,
-        timeout=max(10, min(int(timeout_seconds), 600)),
+        timeout=timeout,
         platform=platform_of(row),
     )
 
 
 @mcp.tool()
 @traced
-async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 180) -> str:
+async def sudo_exec(env_id: str, command: str, timeout_seconds: int = 45) -> str:
     """Run a shell command as root inside the environment identified by env_id.
 
     On Windows there is nothing to elevate: the session already carries a full
     administrator token, so this is exactly exec.
+
+    Capped exactly like exec; for longer work use exec_start(sudo=True).
     """
+    timeout = sync_timeout(timeout_seconds, "sudo_exec")
     row = await resolve(env_id)
     return await ssh_run(
         target_for(row),
         command,
-        timeout=max(10, min(int(timeout_seconds), 600)),
+        timeout=timeout,
         sudo=True,
         platform=platform_of(row),
     )
+
+
+@mcp.tool()
+@traced
+async def exec_start(
+    env_id: str, command: str, sudo: bool = False
+) -> dict[str, Any]:
+    """Start a command in the background and return a job_id immediately.
+
+    Use this for anything that might outlast a synchronous exec: builds, test
+    suites, package installs, large clones. The job is detached on the
+    environment and writes its output to a file there, so it survives the
+    client giving up on a request, the SSH connection dropping and the broker
+    restarting. Stopping polling and coming back later loses nothing.
+
+    Same shell, same already-authenticated git and gh, and the same absence of
+    shared state between calls as exec: chain with `cd /path && ...`. On
+    Windows the command is PowerShell 7.
+
+    Poll it with exec_poll(job_id). sudo=True runs the job as root, and is a
+    no-op on Windows, where the session is already elevated.
+    """
+    row = await resolve(env_id)
+    platform = platform_of(row)
+    host = target_for(row)
+    job_id = secrets.token_hex(8)
+    started = now()
+    out = await ssh_run(
+        host,
+        start_script(platform, job_id, command),
+        timeout=30,
+        sudo=sudo,
+        platform=platform,
+    )
+    if "started" not in out:
+        raise RuntimeError(
+            "the job did not start: " + (out.strip() or "no output")[:300]
+        )
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO jobs (job_id, env_id, command, sudo, workdir,"
+            " started_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                env_id,
+                command,
+                1 if sudo else 0,
+                job_dir(platform, job_id),
+                iso(started),
+            ),
+        )
+    return {
+        "job_id": job_id,
+        "state": "running",
+        "started_at": iso(started),
+        "note": "poll with exec_poll(job_id); reading the output never"
+        " consumes it, so poll as often as you like",
+    }
+
+
+@mcp.tool()
+@traced
+async def exec_poll(
+    job_id: str, tail_lines: int = JOB_TAIL_LINES
+) -> dict[str, Any]:
+    """Report whether a detached job has finished, and return its output.
+
+    state is "running", "done" or "missing"; exit_code is filled in once the
+    job is done. output is the tail of everything written so far, stdout and
+    stderr interleaved, so polling repeatedly is how a long job is followed.
+    The whole log stays at log_path on the environment, where exec can grep or
+    tail it directly.
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError("unknown job_id")
+    row = await resolve(job["env_id"])
+    platform = platform_of(row)
+    host = target_for(row)
+    lines = max(1, min(int(tail_lines), 5000))
+    parsed = parse_poll(
+        await ssh_run(
+            host,
+            poll_script(platform, job_id, lines),
+            timeout=min(30, SYNC_EXEC_MAX_SECONDS),
+            sudo=bool(job["sudo"]),
+            platform=platform,
+        )
+    )
+    sep = "\\" if platform == "windows" else "/"
+    result = {
+        "job_id": job_id,
+        "state": parsed["state"],
+        "exit_code": parsed["exit_code"],
+        "elapsed_seconds": int(
+            (now() - datetime.fromisoformat(job["started_at"])).total_seconds()
+        ),
+        "output_bytes": parsed["output_bytes"],
+        "output": parsed["output"],
+        "log_path": job["workdir"] + sep + "out.log",
+    }
+    if parsed["state"] == "missing":
+        result["note"] = (
+            "the job's working directory is gone: the environment was"
+            " rebooted, or its temporary files were cleaned up"
+        )
+    return result
 
 
 @mcp.tool()
@@ -1125,7 +1441,7 @@ async def browser_tools(env_id: str) -> list[dict[str, Any]]:
             for t in listed.tools
         ]
 
-    return await pw_request(host, action, timeout=60)
+    return await pw_request(host, action, timeout=min(60, SYNC_EXEC_MAX_SECONDS))
 
 
 @mcp.tool()
@@ -1134,7 +1450,7 @@ async def browser_call(
     env_id: str,
     tool: str,
     arguments: dict[str, Any] | None = None,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 45,
 ):
     """Invoke a Playwright tool in this environment's headless Chromium.
 
@@ -1144,7 +1460,7 @@ async def browser_call(
     lifetime of the environment. Screenshots are returned as images.
     """
     host = await require_playwright(env_id)
-    timeout = max(10, min(int(timeout_seconds), 600))
+    timeout = sync_timeout(timeout_seconds, "browser_call")
     args = arguments or {}
 
     async def action(session: ClientSession):
