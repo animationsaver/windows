@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Login shell for the snapshotted user.
+#
+# Tailscale SSH runs the account's login shell for every session and every
+# remote command, so pointing that at this wrapper is what puts `exec` and
+# `sudo_exec` inside the overlay without the broker knowing anything about it.
+# sudo lands inside too: the chroot happens first, so `sudo -n bash -lc ...`
+# elevates within the environment rather than on the host.
+set -uo pipefail
+ENVSNAP_ROOT=${ENVSNAP_ROOT:-/mnt/envsnap}
+MERGED=$ENVSNAP_ROOT/merged
+
+# Already inside, or the overlay is not active: behave like plain bash.
+if [ -n "${ENVSNAP_INSIDE:-}" ] || [ ! -f /run/envsnap/active ] || ! mountpoint -q "$MERGED"; then
+	exec /bin/bash "$@"
+fi
+
+# Escape hatch: '#!host' anywhere in the command runs it on the host
+# instead, which is the only way to reach dockerd, tailscaled or the
+# Actions agent. Matched anywhere rather than only at the start because the
+# broker hands us `bash -lc '<command>'`, so the user's own text is already
+# one layer inside a quoted string by the time we see it.
+cmd=${2:-}
+if [ "${1:-}" = "-c" ] && [ "$cmd" != "${cmd/'#!host'/}" ]; then
+	exec /bin/bash -c "${cmd/'#!host'/}" "${@:3}"
+fi
+
+exec sudo -n /usr/local/sbin/envsnap-enter /bin/bash "$@"

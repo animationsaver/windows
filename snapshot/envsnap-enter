@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Run a command inside the overlay environment. Must be root (sudo).
+# When the overlay is not mounted this degrades to a no-op wrapper (loudly),
+# so it is always safe to put in front of a command.
+set -euo pipefail
+ENVSNAP_ROOT=${ENVSNAP_ROOT:-/mnt/envsnap}
+MERGED=$ENVSNAP_ROOT/merged
+ENVSNAP_USER=${ENVSNAP_USER:-runner}
+
+[ "$#" -gt 0 ] || set -- /bin/bash -l
+
+# Only the mount matters here. /run/envsnap/active gates the *login shell*
+# hook (envsnap-shell and /etc/profile.d/envsnap.sh); an explicit
+# envsnap-enter has to enter the overlay regardless, or "envsnap deactivate"
+# silently turns every later enter into a write to the host root. That is not
+# hypothetical: a file written through envsnap-enter after a deactivate landed
+# on the host and was missing from the snapshot.
+if ! mountpoint -q "$MERGED"; then
+	echo "envsnap-enter: $MERGED is not mounted; running on the host instead" >&2
+	exec "$@"
+fi
+
+uid=${SUDO_UID:-$(id -u "$ENVSNAP_USER")}
+gid=${SUDO_GID:-$(id -g "$ENVSNAP_USER")}
+user=${SUDO_USER:-$ENVSNAP_USER}
+home=$(getent passwd "$user" | cut -d: -f6)
+
+# env -i first so nothing from the host session leaks in, setpriv to drop back
+# to the caller's identity, then a login-ish bash that starts in $HOME.
+exec chroot "$MERGED" /usr/bin/env -i \
+	ENVSNAP_INSIDE=1 \
+	HOME="${home:-/home/$user}" USER="$user" LOGNAME="$user" \
+	TERM="${TERM:-xterm}" \
+	PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+	/usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups -- \
+	/bin/bash -c 'cd "$HOME" >/dev/null 2>&1 || cd /; exec "$@"' envsnap-enter "$@"

@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# envsnap -- overlayfs snapshots for disposable CI environments.
+#
+# The whole environment runs inside an overlayfs whose lower layer is the
+# runner's own root filesystem, so every change (packages, dotfiles, caches)
+# lands in one upper directory. That directory is what gets archived, split
+# into chunks and pushed to a store; the next runner pulls it back and starts
+# where the last one stopped.
+#
+#   $ENVSNAP_ROOT/lower    private bind mount of /
+#   $ENVSNAP_ROOT/upper    the diff -- this is what a snapshot IS
+#   $ENVSNAP_ROOT/work     overlayfs scratch
+#   $ENVSNAP_ROOT/merged   the environment (chroot target)
+#   $ENVSNAP_ROOT/state    index.tsv, manifest.json
+#   $ENVSNAP_ROOT/cache    layer archives in flight
+#
+# Stores: 'ghrelease' (assets of one GitHub Release in a private repo) or
+# 'rclone' (any rclone remote). Assets are capped at 2 GiB each and 1000 per
+# release, so every layer is split into ENVSNAP_CHUNK_MB pieces and uploaded
+# in parallel -- which also happens to be ~3x faster than one big stream.
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+
+ENVSNAP_ROOT=${ENVSNAP_ROOT:-/mnt/envsnap}
+ENVSNAP_NAME=${ENVSNAP_NAME:-default}
+ENVSNAP_STORE=${ENVSNAP_STORE:-ghrelease}
+ENVSNAP_GH_REPO=${ENVSNAP_GH_REPO:-}
+ENVSNAP_REMOTE=${ENVSNAP_REMOTE:-}
+ENVSNAP_PASSPHRASE=${ENVSNAP_PASSPHRASE:-}
+ENVSNAP_ZSTD_LEVEL=${ENVSNAP_ZSTD_LEVEL:-6}
+ENVSNAP_MAX_LAYERS=${ENVSNAP_MAX_LAYERS:-8}
+ENVSNAP_CHUNK_MB=${ENVSNAP_CHUNK_MB:-256}
+ENVSNAP_JOBS=${ENVSNAP_JOBS:-4}
+ENVSNAP_USER=${ENVSNAP_USER:-runner}
+ENVSNAP_EXCLUDE_FILE=${ENVSNAP_EXCLUDE_FILE:-/usr/local/share/envsnap/exclude.txt}
+ENVSNAP_FORCE=${ENVSNAP_FORCE:-0}
+
+LOWER=$ENVSNAP_ROOT/lower
+UPPER=$ENVSNAP_ROOT/upper
+WORK=$ENVSNAP_ROOT/work
+MERGED=$ENVSNAP_ROOT/merged
+STATE=$ENVSNAP_ROOT/state
+CACHE=$ENVSNAP_ROOT/cache
+RUNSTATE=/run/envsnap
+SHELL_WRAPPER=/usr/local/bin/envsnap-shell
+TAG=snap-$ENVSNAP_NAME
+INDEX=$STATE/index.tsv
+MANIFEST=$STATE/manifest.json
+
+# Never walked when building the index: virtual, volatile, or our own tree.
+# (mnt is on the list because $ENVSNAP_ROOT lives there -- snapshotting the
+# snapshot is how you fill a disk.)
+PRUNE_DIRS=(proc sys dev run tmp mnt media var/log var/cache/apt/archives var/lib/docker)
+
+log() { printf 'envsnap %s | %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+die() { printf 'envsnap: error: %s\n' "$*" >&2; exit 1; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (try sudo)"; }
+
+image_id() {
+	local ver arch
+	arch=$(uname -m)
+	ver=${IMAGE_VERSION:-}
+	if [ -z "$ver" ] && [ -r /imagegeneration/imagedata.json ]; then
+		ver=$(jq -r '[..|objects|.Version?|strings]|first // empty' /imagegeneration/imagedata.json 2>/dev/null || true)
+	fi
+	( . /etc/os-release; printf '%s%s/%s/%s' "$ID" "$VERSION_ID" "$arch" "${ver:-unknown}" )
+}
+
+enc() { if [ -n "$ENVSNAP_PASSPHRASE" ]; then openssl enc -aes-256-ctr -pbkdf2 -iter 200000 -pass env:ENVSNAP_PASSPHRASE; else cat; fi; }
+dec() { if [ -n "$ENVSNAP_PASSPHRASE" ]; then openssl enc -d -aes-256-ctr -pbkdf2 -iter 200000 -pass env:ENVSNAP_PASSPHRASE; else cat; fi; }
+
+# --------------------------------------------------------------------------
+# store
+# --------------------------------------------------------------------------
+
+store_ready() {
+	case $ENVSNAP_STORE in
+		ghrelease) [ -n "$ENVSNAP_GH_REPO" ] && command -v gh >/dev/null 2>&1 ;;
+		rclone)    [ -n "$ENVSNAP_REMOTE" ] && command -v rclone >/dev/null 2>&1 ;;
+		none)      return 1 ;;
+		*)         return 1 ;;
+	esac
+}
+
+store_init() {
+	store_ready || die "store '$ENVSNAP_STORE' is not configured"
+	if [ "$ENVSNAP_STORE" = ghrelease ]; then
+		if ! gh release view "$TAG" -R "$ENVSNAP_GH_REPO" >/dev/null 2>&1; then
+			log "creating release $TAG in $ENVSNAP_GH_REPO"
+			gh release create "$TAG" -R "$ENVSNAP_GH_REPO" \
+				--title "envsnap: $ENVSNAP_NAME" \
+				--notes "Environment snapshot store. Managed by envsnap; do not edit by hand." >/dev/null
+		fi
+	fi
+}
+
+store_list() {
+	case $ENVSNAP_STORE in
+		ghrelease) gh release view "$TAG" -R "$ENVSNAP_GH_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true ;;
+		rclone)    rclone lsf "$ENVSNAP_REMOTE/$ENVSNAP_NAME" 2>/dev/null || true ;;
+	esac
+}
+
+store_rm() {
+	case $ENVSNAP_STORE in
+		ghrelease) gh release delete-asset "$TAG" "$1" -R "$ENVSNAP_GH_REPO" --yes >/dev/null 2>&1 || true ;;
+		rclone)    rclone deletefile "$ENVSNAP_REMOTE/$ENVSNAP_NAME/$1" >/dev/null 2>&1 || true ;;
+	esac
+}
+
+# Internal single-object workers, re-entered through xargs so uploads and
+# downloads can run ENVSNAP_JOBS at a time.
+cmd_put() {
+	local f=$1 n i
+	n=$(basename "$f")
+	for i in 1 2 3 4 5; do
+		case $ENVSNAP_STORE in
+			ghrelease)
+				if gh release upload "$TAG" "$f" -R "$ENVSNAP_GH_REPO" >/dev/null 2>&1; then return 0; fi
+				# A half-written asset would make the next attempt fail with 422.
+				# Never use --clobber for this: it deletes first and uploads
+				# second, so a failure there loses the good copy too.
+				store_rm "$n"
+				;;
+			rclone)
+				rclone copyto "$f" "$ENVSNAP_REMOTE/$ENVSNAP_NAME/$n" >/dev/null 2>&1 && return 0
+				;;
+		esac
+		sleep $((i * 3))
+	done
+	die "upload failed after 5 attempts: $n"
+}
+
+cmd_get() {
+	local n=$1 dest=$2 i
+	mkdir -p "$dest"
+	for i in 1 2 3 4 5; do
+		case $ENVSNAP_STORE in
+			ghrelease)
+				if gh release download "$TAG" -R "$ENVSNAP_GH_REPO" -p "$n" -D "$dest" --clobber >/dev/null 2>&1 && [ -s "$dest/$n" ]; then return 0; fi
+				;;
+			rclone)
+				rclone copyto "$ENVSNAP_REMOTE/$ENVSNAP_NAME/$n" "$dest/$n" >/dev/null 2>&1 && return 0
+				;;
+		esac
+		sleep $((i * 3))
+	done
+	die "download failed after 5 attempts: $n"
+}
+
+put_many() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | xargs -r -d '\n' -P "$ENVSNAP_JOBS" -n1 "$SELF" __put; }
+get_many() { local d=$1; shift; [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | xargs -r -d '\n' -P "$ENVSNAP_JOBS" -I{} "$SELF" __get {} "$d"; }
+
+# --------------------------------------------------------------------------
+# index / manifest
+# --------------------------------------------------------------------------
+
+index_write() {
+	local out=$1 d
+	local -a expr=()
+	for d in "${PRUNE_DIRS[@]}"; do expr+=( -path "$UPPER/$d" -o ); done
+	find "$UPPER" -mindepth 1 \( "${expr[@]}" -false \) -prune -o \
+		-printf '%P\t%y\t%s\t%Ts\n' | LC_ALL=C sort > "$out"
+}
+
+# every listed path plus each of its parent directories, so tar records the
+# ownership and mode of the directories it creates on the way down
+ancestors() {
+	awk -F/ '{ p=""; for (i=1;i<NF;i++) { p = p $i; print p; p = p "/" } print $0 }' "$1" \
+		| LC_ALL=C sort -u
+}
+
+manifest_blank() {
+	jq -n --arg name "$ENVSNAP_NAME" --arg image "$(image_id)" --arg now "$(now_iso)" \
+		'{schema:2, gen:0, name:$name, image:$image, created:$now, updated:$now, layers:[]}'
+}
+
+latest_manifest_name() {
+	# grep exiting 1 on 'no snapshot yet' must not take the shell down with it
+	{ store_list | grep -E '^manifest-[0-9]+\.json$' || true; } | LC_ALL=C sort | tail -1
+}
+
+# --------------------------------------------------------------------------
+# mount / umount
+# --------------------------------------------------------------------------
+
+cmd_mount() {
+	need_root
+	if mountpoint -q "$MERGED"; then log "already mounted at $MERGED"; return 0; fi
+	mkdir -p "$LOWER" "$UPPER" "$WORK" "$MERGED" "$STATE" "$CACHE" "$RUNSTATE"
+	cmd_restore
+	# 1. The lower layer is the live root. --make-rprivate immediately after
+	#    the bind is not optional: without it every later mount under
+	#    $ENVSNAP_ROOT propagates back through the bind, and a subsequent
+	#    'rm -rf' of this tree walks into the host's real /dev and /run.
+	#    That is not hypothetical -- it happened, and the host lost /dev.
+	mount --bind / "$LOWER"
+	mount --make-rprivate "$LOWER"
+	# 2. Blank out our own tree inside that view so the environment can never
+	#    see (or recurse into) the snapshot machinery.
+	mkdir -p "$LOWER$ENVSNAP_ROOT"
+	mount -t tmpfs -o mode=0755,size=1M envsnap-void "$LOWER$ENVSNAP_ROOT"
+	# 3. The overlay itself.
+	mount -t overlay envsnap \
+		-o "lowerdir=$LOWER,upperdir=$UPPER,workdir=$WORK,index=off,metacopy=off,xino=off" \
+		"$MERGED"
+	mount --make-rprivate "$MERGED"
+	# 4. Kernel filesystems, as slaves so nothing propagates back out. /tmp is
+	#    shared with the host on purpose: the workflow's keep-alive loop
+	#    watches /tmp/stop.txt, and the broker writes it from inside here.
+	local fs
+	for fs in /proc /sys /dev /run /tmp; do
+		mkdir -p "$MERGED$fs"
+		mount --rbind "$fs" "$MERGED$fs"
+		mount --make-rslave "$MERGED$fs"
+	done
+	: > "$RUNSTATE/mounted"
+	log "overlay ready at $MERGED"
+}
+
+cmd_umount() {
+	need_root
+	# Deliberately loud: a silenced umount failure is what turns the cleanup
+	# below into a host-destroying rm. Nothing here ever deletes a directory.
+	if mountpoint -q "$MERGED"; then umount -R "$MERGED"; fi
+	if mountpoint -q "$LOWER$ENVSNAP_ROOT"; then umount "$LOWER$ENVSNAP_ROOT"; fi
+	if mountpoint -q "$LOWER"; then umount -R "$LOWER"; fi
+	rm -f "$RUNSTATE/mounted"
+	log "unmounted"
+}
+
+cmd_activate() {
+	need_root
+	mountpoint -q "$MERGED" || die "overlay is not mounted"
+	[ -x "$SHELL_WRAPPER" ] || die "$SHELL_WRAPPER is missing"
+	grep -qxF "$SHELL_WRAPPER" /etc/shells || echo "$SHELL_WRAPPER" >> /etc/shells
+	: > "$RUNSTATE/active"
+	chsh -s "$SHELL_WRAPPER" "$ENVSNAP_USER"
+	log "login shell for $ENVSNAP_USER now enters the overlay"
+}
+
+cmd_deactivate() {
+	need_root
+	rm -f "$RUNSTATE/active"
+	chsh -s /bin/bash "$ENVSNAP_USER" || true
+	log "login shell restored to /bin/bash"
+}
+
+# --------------------------------------------------------------------------
+# save
+# --------------------------------------------------------------------------
+
+tar_upper() {
+	local list=$1 st=0
+	tar --numeric-owner --xattrs --xattrs-include='*' --acls --sparse \
+		--no-recursion --warning=no-file-changed --warning=no-file-removed \
+		--exclude-from="$ENVSNAP_EXCLUDE_FILE" -C "$UPPER" -T "$list" -cf - || st=$?
+	# 1 is "some file changed while being read", which is normal on a live box.
+	[ "$st" -le 1 ] || return "$st"
+}
+
+cmd_save() {
+	need_root
+	local full=0
+	if [ "${1:-}" = "--full" ]; then full=1; fi
+	mountpoint -q "$MERGED" || die "overlay is not mounted; nothing to save"
+	store_init
+	[ -s "$MANIFEST" ] || manifest_blank > "$MANIFEST"
+
+	local nlayers
+	nlayers=$(jq '.layers | length' "$MANIFEST")
+	if [ "$nlayers" -ge "$ENVSNAP_MAX_LAYERS" ]; then
+		log "layer budget reached ($nlayers/$ENVSNAP_MAX_LAYERS); compacting into a full snapshot"
+		full=1
+	fi
+	[ -s "$INDEX" ] || full=1
+
+	sync
+	local new=$STATE/index.new list=$STATE/list.txt del=$STATE/deleted.lst
+	index_write "$new"
+	: > "$del"
+	if [ "$full" = 1 ]; then
+		cut -f1 "$new" > "$list"
+	else
+		LC_ALL=C comm -13 "$INDEX" "$new" | cut -f1 > "$list.raw"
+		LC_ALL=C comm -23 <(cut -f1 "$INDEX") <(cut -f1 "$new") > "$del"
+		ancestors "$list.raw" > "$list"
+	fi
+
+	if [ ! -s "$list" ] && [ ! -s "$del" ]; then
+		log "no changes since the last snapshot"
+		mv "$new" "$INDEX"
+		return 0
+	fi
+
+	local id ext file mode chunk
+	id=$(date -u +%Y%m%dT%H%M%SZ)-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')
+	ext=tar.zst
+	if [ -n "$ENVSNAP_PASSPHRASE" ]; then ext=tar.zst.enc; fi
+	mode=incremental
+	if [ "$full" = 1 ]; then mode=full; fi
+	chunk=$((ENVSNAP_CHUNK_MB * 1024 * 1024))
+	rm -rf "${CACHE:?}/up"; mkdir -p "$CACHE/up"
+	file=$CACHE/$id.$ext
+
+	log "building $mode layer $id ($(wc -l < "$list") entries, $(wc -l < "$del") deletions)"
+	tar_upper "$list" | zstd -"$ENVSNAP_ZSTD_LEVEL" -T0 -c | enc > "$file"
+
+	local sha size parts
+	sha=$(sha256sum "$file" | cut -d' ' -f1)
+	size=$(stat -c %s "$file")
+	split -b "$chunk" -a 3 -d "$file" "$CACHE/up/$id.$ext.p"
+	parts=$(find "$CACHE/up" -name "$id.$ext.p*" | wc -l)
+	if [ -s "$del" ]; then cp "$del" "$CACHE/up/$id.del"; fi
+	log "layer is $((size / 1048576)) MiB in $parts chunk(s); uploading with $ENVSNAP_JOBS workers"
+
+	local -a files=()
+	while IFS= read -r f; do files+=("$f"); done < <(find "$CACHE/up" -type f | LC_ALL=C sort)
+	put_many "${files[@]}"
+
+	local gen
+	gen=$(( $(jq -r '.gen // 0' "$MANIFEST") + 1 ))
+	jq --arg id "$id" --arg ext "$ext" --arg sha "$sha" --arg mode "$mode" \
+		--arg now "$(now_iso)" --arg image "$(image_id)" \
+		--argjson size "$size" --argjson parts "$parts" --argjson chunk "$chunk" \
+		--argjson entries "$(wc -l < "$list")" --argjson deleted "$(wc -l < "$del")" \
+		--argjson gen "$gen" \
+		'.gen = $gen | .updated = $now | .image = $image
+		 | .layers += [{id:$id, ext:$ext, sha256:$sha, size:$size, parts:$parts,
+		                chunk:$chunk, entries:$entries, deleted:$deleted,
+		                mode:$mode, created:$now}]
+		 | if $mode == "full" then .layers = [.layers[-1]] else . end' \
+		"$MANIFEST" > "$MANIFEST.tmp"
+	mv "$MANIFEST.tmp" "$MANIFEST"
+
+	# The manifest is written last and under a brand new name, so a snapshot
+	# only becomes visible once every chunk it references is already there.
+	local mname
+	mname=$(printf 'manifest-%06d.json' "$gen")
+	cp "$MANIFEST" "$CACHE/$mname"
+	cmd_put "$CACHE/$mname"
+	mv "$new" "$INDEX"
+	store_prune "$mname"
+	log "saved generation $gen ($mode, $((size / 1048576)) MiB)"
+}
+
+# Delete anything the current manifest does not reference. Runs only after a
+# successful manifest upload, so a crash leaves garbage rather than a hole.
+store_prune() {
+	local keep=$STATE/keep.txt current=$1 n
+	{
+		echo "$current"
+		jq -r '.layers[] | . as $l | [range(0; $l.parts)] | .[] | "\($l.id).\($l.ext).p\(. | tostring | ("00" + .)[-3:])"' "$MANIFEST"
+		jq -r '.layers[] | select(.deleted > 0) | "\(.id).del"' "$MANIFEST"
+	} | LC_ALL=C sort -u > "$keep"
+	store_list | while IFS= read -r n; do
+		[ -n "$n" ] || continue
+		if ! grep -qxF "$n" "$keep"; then
+			log "pruning stale asset $n"
+			store_rm "$n"
+		fi
+	done
+}
+
+# --------------------------------------------------------------------------
+# restore
+# --------------------------------------------------------------------------
+
+cmd_restore() {
+	need_root
+	mkdir -p "$UPPER" "$STATE" "$CACHE"
+	if ! store_ready; then
+		log "no snapshot store configured; starting from an empty overlay"
+		return 0
+	fi
+	local mname
+	mname=$(latest_manifest_name)
+	if [ -z "$mname" ]; then
+		log "no snapshot named '$ENVSNAP_NAME' yet; starting from an empty overlay"
+		return 0
+	fi
+	cmd_get "$mname" "$CACHE"
+	cp "$CACHE/$mname" "$MANIFEST"
+
+	local want have
+	want=$(jq -r '.image // "unknown"' "$MANIFEST")
+	have=$(image_id)
+	if [ "$want" != "$have" ] && [ "$ENVSNAP_FORCE" != 1 ]; then
+		log "WARNING: snapshot was taken on '$want' but this runner is '$have'"
+		log "refusing to graft one image's diff onto another; starting fresh (ENVSNAP_FORCE=1 overrides)"
+		rm -f "$MANIFEST"
+		return 0
+	fi
+
+	local n i id ext parts sha
+	n=$(jq '.layers | length' "$MANIFEST")
+	log "restoring $n layer(s) of snapshot '$ENVSNAP_NAME' (generation $(jq -r .gen "$MANIFEST"))"
+	for i in $(seq 0 $((n - 1))); do
+		id=$(jq -r ".layers[$i].id" "$MANIFEST")
+		ext=$(jq -r ".layers[$i].ext" "$MANIFEST")
+		parts=$(jq -r ".layers[$i].parts" "$MANIFEST")
+		sha=$(jq -r ".layers[$i].sha256" "$MANIFEST")
+		rm -rf "${CACHE:?}/dl"; mkdir -p "$CACHE/dl"
+		local -a names=()
+		local p
+		for p in $(seq 0 $((parts - 1))); do
+			names+=("$(printf '%s.%s.p%03d' "$id" "$ext" "$p")")
+		done
+		log "layer $((i + 1))/$n: fetching $parts chunk(s)"
+		get_many "$CACHE/dl" "${names[@]}"
+		cat "$CACHE/dl/$id.$ext.p"* > "$CACHE/dl/$id.$ext"
+		local got
+		got=$(sha256sum "$CACHE/dl/$id.$ext" | cut -d' ' -f1)
+		[ "$got" = "$sha" ] || die "checksum mismatch on layer $id (want $sha, got $got)"
+		dec < "$CACHE/dl/$id.$ext" | zstd -dc \
+			| tar --numeric-owner --xattrs --xattrs-include='*' --acls \
+			      -xf - -C "$UPPER"
+		if [ "$(jq -r ".layers[$i].deleted" "$MANIFEST")" -gt 0 ]; then
+			cmd_get "$id.del" "$CACHE/dl"
+			while IFS= read -r rel; do
+				[ -n "$rel" ] || continue
+				rm -rf -- "${UPPER:?}/${rel:?}"
+			done < "$CACHE/dl/$id.del"
+		fi
+		rm -rf "${CACHE:?}/dl"
+	done
+	index_write "$INDEX"
+	log "restore complete ($(du -sh "$UPPER" | cut -f1) in the upper layer)"
+}
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+cmd_status() {
+	printf 'name        : %s\n' "$ENVSNAP_NAME"
+	printf 'image       : %s\n' "$(image_id)"
+	printf 'store       : %s' "$ENVSNAP_STORE"
+	case $ENVSNAP_STORE in
+		ghrelease) printf ' (%s, tag %s)' "${ENVSNAP_GH_REPO:-unset}" "$TAG" ;;
+		rclone)    printf ' (%s)' "${ENVSNAP_REMOTE:-unset}" ;;
+	esac
+	printf '\n'
+	printf 'encryption  : %s\n' "$([ -n "$ENVSNAP_PASSPHRASE" ] && echo 'aes-256-ctr' || echo 'off')"
+	printf 'chunk size  : %s MiB, %s parallel workers\n' "$ENVSNAP_CHUNK_MB" "$ENVSNAP_JOBS"
+	if mountpoint -q "$MERGED"; then
+		printf 'mounted     : yes (%s)\n' "$MERGED"
+		printf 'upper size  : %s\n' "$(du -sh "$UPPER" 2>/dev/null | cut -f1)"
+	else
+		printf 'mounted     : no\n'
+	fi
+	printf 'shell hook  : %s\n' "$([ -f "$RUNSTATE/active" ] && echo active || echo inactive)"
+	if [ -s "$MANIFEST" ]; then
+		printf 'generation  : %s, %s layer(s), %s MiB stored\n' \
+			"$(jq -r .gen "$MANIFEST")" "$(jq -r '.layers|length' "$MANIFEST")" \
+			"$(jq -r '[.layers[].size]|add // 0 | . / 1048576 | floor' "$MANIFEST")"
+		jq -r '.layers[] | "  \(.created)  \(.mode)\t\(.entries) entries\t\(.parts) chunk(s)\t\(.size / 1048576 | floor) MiB"' "$MANIFEST"
+	else
+		printf 'generation  : none\n'
+	fi
+}
+
+usage() {
+	cat <<'USAGE'
+usage: envsnap <command>
+
+  mount        restore the snapshot and mount the overlay
+  umount       unmount the overlay (never deletes anything)
+  activate     make the overlay the login shell's world
+  deactivate   undo activate
+  restore      pull the snapshot into the upper layer only
+  save [--full]  archive the upper layer and push it to the store
+  status       show configuration and stored generations
+USAGE
+}
+
+case "${1:-}" in
+	mount)      shift; cmd_mount "$@" ;;
+	umount)     shift; cmd_umount "$@" ;;
+	activate)   shift; cmd_activate "$@" ;;
+	deactivate) shift; cmd_deactivate "$@" ;;
+	restore)    shift; cmd_restore "$@" ;;
+	save)       shift; cmd_save "$@" ;;
+	status)     shift; cmd_status "$@" ;;
+	__put)      shift; cmd_put "$@" ;;
+	__get)      shift; cmd_get "$@" ;;
+	-h|--help|help|"") usage ;;
+	*)          usage; exit 2 ;;
+esac

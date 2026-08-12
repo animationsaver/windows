@@ -13,6 +13,8 @@ GitHub Actions のランナー上に、**Tailscale 経由で接続できるリ�
 | `.github/workflows/ubuntu-playwright-mcp.yml` | **【主】** Ubuntu に Playwright MCP + SSH MCP（Tailscale Funnel で公開 HTTPS）+ 常設 RDP デスクトップ（Tailscale 直結）を起動 |
 | `.github/workflows/rdp.yml` | Windows ランナーに RDP 接続（後述） |
 | `.github/workflows/vnc.yml` | VNC ベースのデスクトップ（旧構成） |
+| `.github/workflows/ephemeral-env.yml` | broker が起動する使い捨て Linux 環境（`platform="linux"`） |
+| `.github/workflows/warm-env.yml` | 同じく broker から起動するが、overlayfs のスナップショットで**前回の状態を引き継ぐ**環境（`platform="linux-warm"`、詳細は `snapshot/README.md`） |
 
 ---
 
