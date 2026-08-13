@@ -51,6 +51,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import anyio
 import asyncssh
 import httpx
 from mcp import ClientSession
@@ -675,6 +676,8 @@ async def get_conn(host: str) -> asyncssh.SSHClientConnection:
 
 
 def drop_conn(host: str) -> None:
+    # The Playwright session rides this connection, so it dies with it.
+    pw_drop(host)
     entry = _tunnels.pop(host, None)
     if entry is not None:
         try:
@@ -962,42 +965,376 @@ async def pw_endpoint(host: str) -> str:
         return "http://127.0.0.1:" + str(port) + "/mcp"
 
 
-async def pw_session(host: str, timeout: int):
-    """Async context manager yielding an initialised upstream ClientSession."""
-    url = await pw_endpoint(host)
-    return streamablehttp_client(
-        url,
-        timeout=timedelta(seconds=timeout),
-        sse_read_timeout=timedelta(seconds=timeout + 60),
+# How long the upstream HTTP client waits, independent of any one caller's
+# deadline: the per-call limit is enforced with wait_for inside the session, so
+# one impatient browser_call cannot shorten the transport for the next one.
+PW_HTTP_TIMEOUT = max(60, SYNC_EXEC_MAX_SECONDS)
+# The standalone GET stream is idle between calls and must outlive those gaps,
+# or the session tears itself down while nothing at all is wrong.
+PW_SSE_READ_TIMEOUT = int(os.environ.get("PW_SSE_READ_SECONDS", "3600"))
+PW_ATTEMPTS = max(1, int(os.environ.get("PW_ATTEMPTS", "3")))
+
+
+def flatten_exc(exc: BaseException) -> list[BaseException]:
+    """exc plus every exception nested inside it.
+
+    The MCP SDK builds its transport out of anyio task groups, so what reaches
+    a caller is almost always an ExceptionGroup wrapping the real failure, and
+    httpx wraps some of its own errors again. isinstance() against the wrapper
+    matches nothing, which is why the previous `except (OSError, asyncssh.Error)`
+    around the two reconnect attempts never once fired: a dropped tunnel raises
+    ExceptionGroup(ConnectError), and neither of those is an OSError.
+    """
+    out: list[BaseException] = []
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        out.append(cur)
+        stack.extend(getattr(cur, "exceptions", None) or [])
+        stack.append(cur.__cause__)
+        stack.append(cur.__context__)
+    return out
+
+
+# Failures that mean "this never reached the server, or the stream it would
+# have travelled on is gone". Retrying those is safe; retrying a tool that may
+# already have clicked something is not, so nothing else is retried.
+PW_RETRYABLE: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    asyncssh.Error,
+    httpx.TransportError,
+    anyio.BrokenResourceError,
+    anyio.ClosedResourceError,
+    anyio.EndOfStream,
+)
+
+
+def pw_http_status(causes: list[BaseException]) -> int | None:
+    for cause in causes:
+        resp = getattr(cause, "response", None)
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int):
+            return code
+    return None
+
+
+# How the SDK words "the server no longer knows this session id". There is no
+# status code to match on in that case: playwright-mcp answers 404, the client
+# turns it into a protocol error, and the response object never reaches us.
+PW_SESSION_LOST_TEXT = (
+    "session terminated",
+    "session not found",
+    "missing session id",
+    "no valid session id",
+    "session expired",
+)
+
+
+def pw_session_lost(causes: list[BaseException]) -> bool:
+    """True when the upstream forgot our session, i.e. it restarted under us.
+
+    The call never ran, so opening a fresh session and sending it again is both
+    safe and the only way through. This matches on the message rather than the
+    exception type because ClientSession raises McpError for every protocol
+    error, and retrying all of those would re-send calls that genuinely failed.
+    """
+    if pw_http_status(causes) == 404:
+        return True
+    return any(
+        any(text in str(c).lower() for text in PW_SESSION_LOST_TEXT) for c in causes
     )
 
 
-async def pw_request(host: str, action, timeout: int):
-    """Run `action(session)` against Playwright MCP, reconnecting once."""
-    last: Exception | None = None
-    for attempt in (1, 2):
+def pw_retryable(causes: list[BaseException]) -> bool:
+    return any(isinstance(c, PW_RETRYABLE) for c in causes) or pw_session_lost(causes)
+
+
+def pw_hint(causes: list[BaseException]) -> str:
+    status = pw_http_status(causes)
+    if status == 403:
+        return (
+            " -- playwright-mcp refused the Host header. It enforces a host"
+            " check that defaults to the single host it bound to, and this"
+            " broker arrives through an SSH forward as 127.0.0.1:<port>, so"
+            " the server has to be started with --allowed-hosts '*'"
+        )
+    if pw_session_lost(causes):
+        return (
+            " -- the session is gone because playwright-mcp restarted;"
+            " reconnecting loses whatever the browser had open"
+        )
+    if any(isinstance(c, asyncssh.Error) for c in causes):
+        return " -- the SSH connection to the environment failed"
+    if any(isinstance(c, httpx.TransportError) for c in causes):
+        return (
+            " -- nothing is listening on the far end of the tunnel; is"
+            " playwright-mcp running on the environment?"
+        )
+    return ""
+
+
+class PwSession:
+    """One long-lived MCP session to one environment, owned by its own task.
+
+    Two problems are solved here at once.
+
+    The session has to be long-lived because playwright-mcp keys the browser
+    context to the MCP session. The previous revision opened a client,
+    initialised it, made one call and closed all of it again per browser_call,
+    so every call arrived at a fresh about:blank: browser_navigate followed by
+    browser_snapshot saw nothing, and browser_call's own promise that "browser
+    state persists between calls" was false. It also paid a browser cold start
+    every time.
+
+    The session has to be owned by one task because the SDK's transport is
+    built from anyio task groups, and anyio refuses to let a cancel scope be
+    exited by a task other than the one that entered it. A session opened
+    inside one request and closed inside another therefore explodes on the way
+    out. So the contexts are entered, used and exited by a single owner task,
+    and callers hand it work through a queue.
+
+    Serialising calls per environment is not a limitation either: there is one
+    browser over there, and interleaving a click with a navigate was never
+    going to be meaningful.
+    """
+
+    def __init__(self, host: str, url: str) -> None:
+        self.host = host
+        self.url = url
+        self.server = ""
+        self._jobs: asyncio.Queue[Any] = asyncio.Queue()
+        self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._done = asyncio.Event()
+        self._task = asyncio.create_task(self._run(), name="pw-session-" + host)
+
+    @property
+    def alive(self) -> bool:
+        return not self._done.is_set() and not self._task.done()
+
+    async def _run(self) -> None:
         try:
-            client = await pw_session(host, timeout)
-            async with client as (read, write, _):
+            async with streamablehttp_client(
+                self.url,
+                timeout=timedelta(seconds=PW_HTTP_TIMEOUT),
+                sse_read_timeout=timedelta(seconds=PW_SSE_READ_TIMEOUT),
+            ) as (read, write, _):
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    return await action(session)
-        except (OSError, asyncssh.Error) as exc:
+                    info = await session.initialize()
+                    self.server = getattr(info.serverInfo, "name", "?") + " " + str(
+                        getattr(info.serverInfo, "version", "?")
+                    )
+                    log.info("playwright session up on %s (%s)", self.host, self.server)
+                    if not self._ready.done():
+                        self._ready.set_result(None)
+                    await self._serve(session)
+        except BaseException as exc:  # reported to whoever is waiting
+            if not self._ready.done():
+                self._fail(self._ready, exc)
+            else:
+                log.warning(
+                    "playwright session on %s ended: %s: %s",
+                    self.host,
+                    type(exc).__name__,
+                    exc,
+                )
+            self._drain(exc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            self._done.set()
+            self._drain(RuntimeError("playwright session closed"))
+
+    async def _serve(self, session: ClientSession) -> None:
+        while True:
+            job = await self._jobs.get()
+            if job is None:
+                return
+            action, fut, timeout = job
+            if fut.done():  # caller gave up while this was queued
+                continue
+            try:
+                result = await asyncio.wait_for(action(session), timeout)
+            except asyncio.CancelledError as exc:
+                # Not the caller's cancellation: either close() is unwinding
+                # this session, or the SDK's transport task group cancelled us
+                # because the connection under it died. _fail turns it into a
+                # connection error so the caller retries instead of being
+                # cancelled themselves, and it is re-raised so anyio can exit
+                # the cancel scope in the task that entered it.
+                self._fail(fut, exc)
+                raise
+            except asyncio.TimeoutError as exc:
+                # The call is gone, the session is not: the SDK cancels the
+                # in-flight request and matches replies by id, so a late answer
+                # is discarded rather than handed to the next caller.
+                self._fail(fut, exc)
+            except BaseException as exc:
+                self._fail(fut, exc)
+                if pw_retryable(flatten_exc(exc)):
+                    # The stream itself is gone. Unwinding here, inside the
+                    # task that entered the contexts, is the only place anyio
+                    # allows it to happen.
+                    raise
+            else:
+                if not fut.done():
+                    fut.set_result(result)
+
+    def _fail(self, fut: asyncio.Future, exc: BaseException) -> None:
+        """Hand an error to a caller -- never a cancellation.
+
+        A CancelledError raised in this task belongs to this task. Passing it
+        to the caller's future cancels *their* request, which asyncio then
+        propagates through the tool call and the HTTP handler above it, so a
+        browser that went away takes the request with it instead of failing
+        it. Reported as a connection error it is both accurate and retryable.
+        """
+        if fut.done():
+            return
+        if isinstance(exc, asyncio.CancelledError):
+            exc = ConnectionError(
+                "the playwright-mcp session was torn down while the call was"
+                " in flight"
+            )
+        fut.set_exception(exc)
+
+    def _drain(self, exc: BaseException) -> None:
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if job is not None:
+                self._fail(job[1], exc)
+
+    async def submit(self, action, timeout: int):
+        """Queue `action` for the owner task and wait for its answer."""
+        await self._ready
+        if not self.alive:
+            raise ConnectionError("the playwright-mcp session has already ended")
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._jobs.put_nowait((action, fut, timeout))
+        # Waiting on the future alone would hang if the owner task unwound
+        # between the push and its own drain, which is exactly what happens
+        # when the server dies at the wrong moment.
+        ended = asyncio.create_task(self._done.wait())
+        try:
+            await asyncio.wait({fut, ended}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            fut.cancel()  # the owner task skips jobs whose caller has gone
+            raise
+        finally:
+            ended.cancel()
+        if not fut.done():
+            self._fail(
+                fut,
+                ConnectionError("the playwright-mcp session ended before the call ran"),
+            )
+        return await fut
+
+    def close(self) -> None:
+        """Ask the owner task to unwind, and stop waiting for it after a bit."""
+        self._jobs.put_nowait(None)
+
+        async def reap() -> None:
+            try:
+                await asyncio.wait_for(self._done.wait(), 10)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+
+        asyncio.ensure_future(reap())
+
+
+_pw_sessions: dict[str, PwSession] = {}
+_pw_lock = asyncio.Lock()
+
+
+async def pw_get_session(host: str) -> PwSession:
+    async with _pw_lock:
+        session = _pw_sessions.get(host)
+        if session is not None and session.alive:
+            return session
+        if session is not None:
+            session.close()
+        url = await pw_endpoint(host)
+        session = PwSession(host, url)
+        _pw_sessions[host] = session
+        return session
+
+
+def pw_drop(host: str) -> None:
+    session = _pw_sessions.pop(host, None)
+    if session is not None:
+        session.close()
+
+
+def pw_drop_tunnel(host: str) -> None:
+    """Discard the forward without touching the SSH connection under it.
+
+    drop_conn() aborts the whole connection, which is right when SSH itself
+    failed and wrong for everything else: a browser that went away is no reason
+    to kill the exec running next to it.
+    """
+    entry = _tunnels.pop(host, None)
+    if entry is not None:
+        try:
+            entry[1].close()
+        except Exception:
+            pass
+
+
+async def pw_request(host: str, action, timeout: int):
+    """Run `action(session)` on the environment's live Playwright session."""
+    last: BaseException | None = None
+    hint = ""
+    for attempt in range(1, PW_ATTEMPTS + 1):
+        try:
+            session = await pw_get_session(host)
+            return await session.submit(action, timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            # Deliberately not retried: the tool may already have done half of
+            # what it was asked to do, and doing it twice is worse than saying so.
+            raise RuntimeError(
+                "the browser did not answer within "
+                + str(timeout)
+                + "s. The first call in an environment also starts the browser;"
+                + " retry with a larger timeout_seconds if that is what happened."
+            ) from exc
+        except BaseException as exc:
+            causes = flatten_exc(exc)
+            hint = pw_hint(causes)
+            last = exc
             log.warning(
-                "playwright attempt %s/2 on %s failed: %s: %s",
+                "playwright attempt %s/%s on %s failed: %s: %s%s",
                 attempt,
+                PW_ATTEMPTS,
                 host,
                 type(exc).__name__,
                 exc,
+                hint,
             )
-            last = exc
-            drop_conn(host)
+            pw_drop(host)
+            if any(isinstance(c, asyncssh.Error) for c in causes):
+                drop_conn(host)  # SSH really is broken; take the tunnel with it
+            else:
+                pw_drop_tunnel(host)
+            if not pw_retryable(causes) or attempt == PW_ATTEMPTS:
+                break
+            await asyncio.sleep(min(2 ** (attempt - 1), 5))
     raise RuntimeError(
         "could not reach Playwright MCP on "
         + host
         + ": "
+        + type(last).__name__
+        + ": "
         + str(last)
-        + " (is the environment on profile=playwright, and finished booting?)"
+        + hint
+        + " (is the environment on profile='playwright', and finished booting?)"
     )
 
 
@@ -1457,7 +1794,12 @@ async def browser_call(
     `tool` and `arguments` come from browser_tools, e.g.
     tool="browser_navigate", arguments={"url": "https://example.com"}.
     Browser state (pages, cookies, session) persists between calls for the
-    lifetime of the environment. Screenshots are returned as images.
+    lifetime of the environment: the broker holds one MCP session per
+    environment open, so browser_navigate followed by browser_snapshot sees
+    the page it just loaded. Calls to one environment are served in order,
+    since there is only one browser at the other end. The first call also
+    starts that browser, so give it a larger timeout_seconds than the rest.
+    Screenshots are returned as images.
     """
     host = await require_playwright(env_id)
     timeout = sync_timeout(timeout_seconds, "browser_call")
