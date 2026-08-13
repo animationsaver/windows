@@ -59,6 +59,13 @@ jobs:
       SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
       SSH_PORT: "2222"
       PW_MCP_PORT: "8931"
+      # Pinned on purpose: "@latest" re-resolves from the registry on every
+      # start, so a restart could swap the server version mid-session.
+      PW_MCP_VERSION: "0.0.79"
+      # The paths the log-collection step already knows about.
+      PW_MCP_LOG: 'C:\gha-env\pw-mcp.log'
+      PW_MCP_ERR_LOG: 'C:\gha-env\pw-mcp.err.log'
+      PW_MCP_STATE_DIR: 'C:\gha-env\pw-mcp'
       SSH_LOGIN_USER: "runneradmin"
       STOP_FILE: 'C:\stop.txt'
       WORK_DIR: 'C:\gha-env'
@@ -320,29 +327,18 @@ jobs:
       - name: Install Playwright MCP (profile=playwright)
         if: ${{ inputs.profile == 'playwright' }}
         run: |
-          npm install -g "@playwright/mcp@latest"
-          npx playwright install chromium
-          $start = Join-Path $env:WORK_DIR "start-pw-mcp.ps1"
-          $lines = @(
-            '$port = if ($env:PW_MCP_PORT) { $env:PW_MCP_PORT } else { "8931" }',
-            '$argv = @("-y", "@playwright/mcp@latest", "--port", $port, "--host", "127.0.0.1", "--headless", "--isolated", "--allowed-hosts", "*")',
-            'Start-Process -FilePath "npx.cmd" -ArgumentList $argv -WindowStyle Hidden -RedirectStandardOutput "C:\gha-env\pw-mcp.log" -RedirectStandardError "C:\gha-env\pw-mcp.err.log"'
-          ) -join "`r`n"
-          $utf8 = New-Object System.Text.UTF8Encoding($false)
-          [IO.File]::WriteAllText($start, $lines + "`r`n", $utf8)
           # Bound to loopback and never published on the tailnet: the broker
           # reaches it through an SSH port forward, so an authorised SSH
-          # session is the only way in.
-          & $start
-          for ($i = 0; $i -lt 60; $i++) {
-            if ((Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded) { break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded) {
-            Get-Content "C:\gha-env\pw-mcp.err.log" -Tail 40 -ErrorAction SilentlyContinue
-            throw "Playwright MCP did not come up on 127.0.0.1:$env:PW_MCP_PORT"
-          }
-          Write-Host "playwright mcp up on 127.0.0.1:$env:PW_MCP_PORT"
+          # session is the only way in. That is also why the server runs with
+          # --allowed-hosts '*': the Host header it sees is whatever local
+          # port asyncssh picked, not the one it bound to.
+          & "$env:GITHUB_WORKSPACE\scripts\pw-mcp.ps1" install
+          if ($LASTEXITCODE -ne 0) { throw "Playwright MCP install failed" }
+          # start returns only once a real MCP initialize has succeeded, so a
+          # browser that cannot launch fails this step instead of somebody's
+          # first browser_call twenty minutes later.
+          & "$env:GITHUB_WORKSPACE\scripts\pw-mcp.ps1" start
+          if ($LASTEXITCODE -ne 0) { throw "Playwright MCP did not come up on 127.0.0.1:$env:PW_MCP_PORT" }
 
       - name: Announce endpoints
         run: |
@@ -371,11 +367,15 @@ jobs:
               Start-Service sshd -ErrorAction SilentlyContinue
             }
             if ($env:PROFILE -eq 'playwright') {
-              $up = (Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:PW_MCP_PORT) -WarningAction SilentlyContinue).TcpTestSucceeded
-              if (-not $up) {
-                Write-Host "$(Get-Date -Format o) playwright mcp is down; restarting it"
-                & (Join-Path $env:WORK_DIR "start-pw-mcp.ps1")
-              }
+              # Test-NetConnection only proves something holds the port. It
+              # stayed true for a server that answered every real call with
+              # 403, and for one whose browser had already died. watchdog does
+              # an MCP initialize instead, wants two consecutive failures
+              # before it believes them, and honours a cooldown so a slow boot
+              # is never restarted on top of itself.
+              & "$env:GITHUB_WORKSPACE\scripts\pw-mcp.ps1" watchdog
+              # A failing tick is not a failing job.
+              $global:LASTEXITCODE = 0
             }
             Start-Sleep -Seconds 30
           }

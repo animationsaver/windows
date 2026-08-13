@@ -44,6 +44,12 @@ jobs:
       SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
       SSH_PORT: "2222"
       PW_MCP_PORT: "8931"
+      # Pinned on purpose: "@latest" re-resolves from the registry on every
+      # start, so a restart could swap the server version mid-session.
+      PW_MCP_VERSION: "0.0.79"
+      # The Host check has to go for the same reason as on Linux; --isolated
+      # and --no-sandbox are what this environment always ran with.
+      PW_MCP_EXTRA_ARGS: "--headless --allowed-hosts * --isolated --no-sandbox"
       SSHD_DIR: /Users/runner/env-sshd
 
     steps:
@@ -140,10 +146,7 @@ jobs:
 
       - name: Install Playwright MCP (profile=playwright)
         if: ${{ inputs.profile == 'playwright' }}
-        run: |
-          set -euo pipefail
-          npm install -g @playwright/mcp@latest
-          npx playwright install chromium
+        run: ./scripts/pw-mcp.sh install
 
       - name: Install Tailscale (CLI build) and join the tailnet
         env:
@@ -253,23 +256,13 @@ jobs:
       - name: Start Playwright MCP (profile=playwright)
         if: ${{ inputs.profile == 'playwright' }}
         run: |
-          set -euo pipefail
-          cat > "$HOME/start-pw-mcp.sh" <<'SH'
-          #!/bin/bash
-          exec npx -y @playwright/mcp@latest \
-            --port "${PW_MCP_PORT:-8931}" \
-            --host 127.0.0.1 \
-            --headless \
-            --isolated \
-            --no-sandbox
-          SH
-          chmod +x "$HOME/start-pw-mcp.sh"
-          nohup "$HOME/start-pw-mcp.sh" > /tmp/pw-mcp.log 2>&1 &
-          for _ in $(seq 1 60); do
-            if nc -z 127.0.0.1 "$PW_MCP_PORT"; then break; fi
-            sleep 2
-          done
-          nc -z 127.0.0.1 "$PW_MCP_PORT" || (tail -50 /tmp/pw-mcp.log; exit 1)
+          # This environment started the server without --allowed-hosts, so
+          # playwright-mcp's Host check answered every call the broker made
+          # through its SSH forward with "403 Access is only allowed at
+          # localhost:8931": an open port, a running browser, and not one
+          # usable browser_call. PW_MCP_EXTRA_ARGS keeps the isolated profile
+          # this environment always used and adds the flag.
+          "$GITHUB_WORKSPACE/scripts/pw-mcp.sh" start
 
       - name: Announce endpoints
         run: |
@@ -304,9 +297,11 @@ jobs:
               echo "tailnet forward for $SSH_PORT is gone; re-applying it"
               sudo "$TS_BIN/tailscale" serve --bg --tcp "$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT" || true
             fi
-            if [ "$PROFILE" = playwright ] && ! nc -z 127.0.0.1 "$PW_MCP_PORT" >/dev/null 2>&1; then
-              echo "playwright mcp is down; restarting it"
-              nohup "$HOME/start-pw-mcp.sh" >> /tmp/pw-mcp.log 2>&1 &
+            if [ "$PROFILE" = playwright ]; then
+              # "nc -z" only proves something holds the port; it stayed green
+              # through the 403s above and through a server whose browser had
+              # died. watchdog asks the server to initialize a session instead.
+              "$GITHUB_WORKSPACE/scripts/pw-mcp.sh" watchdog || true
             fi
             sleep 30
           done

@@ -1,0 +1,7 @@
+# Python bytecode. A .pyc was committed once and kept shipping stale
+# bytecode to anyone whose source timestamps looked older than it.
+__pycache__/
+*.py[cod]
+
+# The server writes traces and downloads here when it runs from a repo root.
+.playwright-mcp/
