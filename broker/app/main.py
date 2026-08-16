@@ -683,9 +683,34 @@ async def dispatch_workflow(
 # the handshake on each command. The Playwright tunnel rides the same
 # connection, keyed by it so a reconnect invalidates the stale listener.
 _conns: dict[str, asyncssh.SSHClientConnection] = {}
-_tunnels: dict[str, tuple[asyncssh.SSHClientConnection, Any, int]] = {}
+# Keyed by (host, remote port). One environment can run more than one MCP
+# server, so a single forward per host would hand opencode the browser's port.
+_tunnels: dict[tuple[str, int], tuple[asyncssh.SSHClientConnection, Any, int]] = {}
 _conn_lock = asyncio.Lock()
 _tunnel_lock = asyncio.Lock()
+
+def drop_tunnels(host: str, remote_port: int | None = None) -> None:
+    """Close the forwards to `host`, or only the one to `remote_port`.
+
+    drop_conn() aborts the whole connection, which is right when SSH itself
+    failed and wrong for everything else: a browser that went away is no reason
+    to kill the exec running next to it, or the opencode bridge on the port
+    next door.
+    """
+    doomed = [
+        key
+        for key in _tunnels
+        if key[0] == host and (remote_port is None or key[1] == remote_port)
+    ]
+    for key in doomed:
+        entry = _tunnels.pop(key, None)
+        if entry is None:
+            continue
+        try:
+            entry[1].close()
+        except Exception:
+            pass
+
 # host -> (port, private key PEM or None, login account). Filled in by
 # target_for(); the default covers Linux (Tailscale SSH on 22, "none" auth,
 # the "runner" account).
@@ -728,7 +753,8 @@ async def get_conn(host: str) -> asyncssh.SSHClientConnection:
 def drop_conn(host: str) -> None:
     # The Playwright session rides this connection, so it dies with it.
     pw_drop(host)
-    entry = _tunnels.pop(host, None)
+    oc_drop(host)
+    drop_tunnels(host)
     if entry is not None:
         try:
             entry[1].close()
@@ -992,26 +1018,29 @@ def get_job(job_id: str) -> sqlite3.Row | None:
 # --------------------------------------------------------------------------
 
 
-async def pw_endpoint(host: str) -> str:
-    """Return a local URL that forwards to Playwright MCP on the runner.
+async def mcp_endpoint(host: str, remote_port: int) -> str:
+    """Return a local URL that forwards to an MCP server on the runner.
 
     asyncssh binds an ephemeral loopback port here and tunnels it to
-    127.0.0.1:PW_MCP_PORT on the environment, so nothing has to listen on the
-    tailnet and no serve rule is needed.
+    127.0.0.1:remote_port on the environment, so nothing has to listen on the
+    tailnet and no serve rule is needed. A box can run several of these at
+    once -- Playwright on PW_MCP_PORT, the opencode bridge on
+    OPENCODE_MCP_PORT -- so forwards are keyed by port as well as host.
     """
     conn = await get_conn(host)
     async with _tunnel_lock:
-        entry = _tunnels.get(host)
+        key = (host, remote_port)
+        entry = _tunnels.get(key)
         if entry is not None and entry[0] is conn:
             return "http://127.0.0.1:" + str(entry[2]) + "/mcp"
         listener = await conn.forward_local_port(
-            "127.0.0.1", 0, "127.0.0.1", PW_MCP_PORT
+            "127.0.0.1", 0, "127.0.0.1", remote_port
         )
         port = listener.get_port()
         log.info(
-            "tunnel 127.0.0.1:%s -> %s:127.0.0.1:%s", port, host, PW_MCP_PORT
+            "tunnel 127.0.0.1:%s -> %s:127.0.0.1:%s", port, host, remote_port
         )
-        _tunnels[host] = (conn, listener, port)
+        _tunnels[key] = (conn, listener, port)
         return "http://127.0.0.1:" + str(port) + "/mcp"
 
 
@@ -1127,7 +1156,7 @@ def pw_hint(causes: list[BaseException]) -> str:
     return ""
 
 
-class PwSession:
+class RelaySession:
     """One long-lived MCP session to one environment, owned by its own task.
 
     Two problems are solved here at once.
@@ -1152,14 +1181,15 @@ class PwSession:
     going to be meaningful.
     """
 
-    def __init__(self, host: str, url: str) -> None:
+    def __init__(self, host: str, url: str, label: str = "playwright") -> None:
         self.host = host
         self.url = url
+        self.label = label
         self.server = ""
         self._jobs: asyncio.Queue[Any] = asyncio.Queue()
         self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._done = asyncio.Event()
-        self._task = asyncio.create_task(self._run(), name="pw-session-" + host)
+        self._task = asyncio.create_task(self._run(), name=self.label + "-session-" + host)
 
     @property
     def alive(self) -> bool:
@@ -1177,7 +1207,7 @@ class PwSession:
                     self.server = getattr(info.serverInfo, "name", "?") + " " + str(
                         getattr(info.serverInfo, "version", "?")
                     )
-                    log.info("playwright session up on %s (%s)", self.host, self.server)
+                    log.info("%s session up on %s (%s)", self.label, self.host, self.server)
                     if not self._ready.done():
                         self._ready.set_result(None)
                     await self._serve(session)
@@ -1186,7 +1216,8 @@ class PwSession:
                 self._fail(self._ready, exc)
             else:
                 log.warning(
-                    "playwright session on %s ended: %s: %s",
+                    "%s session on %s ended: %s: %s",
+                    self.label,
                     self.host,
                     type(exc).__name__,
                     exc,
@@ -1196,7 +1227,7 @@ class PwSession:
                 raise
         finally:
             self._done.set()
-            self._drain(RuntimeError("playwright session closed"))
+            self._drain(RuntimeError(self.label + " session closed"))
 
     async def _serve(self, session: ClientSession) -> None:
         while True:
@@ -1246,8 +1277,8 @@ class PwSession:
             return
         if isinstance(exc, asyncio.CancelledError):
             exc = ConnectionError(
-                "the playwright-mcp session was torn down while the call was"
-                " in flight"
+                "the " + self.label + " MCP session was torn down while the"
+                " call was in flight"
             )
         fut.set_exception(exc)
 
@@ -1264,7 +1295,7 @@ class PwSession:
         """Queue `action` for the owner task and wait for its answer."""
         await self._ready
         if not self.alive:
-            raise ConnectionError("the playwright-mcp session has already ended")
+            raise ConnectionError("the " + self.label + " MCP session has already ended")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._jobs.put_nowait((action, fut, timeout))
         # Waiting on the future alone would hang if the owner task unwound
@@ -1281,7 +1312,9 @@ class PwSession:
         if not fut.done():
             self._fail(
                 fut,
-                ConnectionError("the playwright-mcp session ended before the call ran"),
+                ConnectionError(
+                    "the " + self.label + " MCP session ended before the call ran"
+                ),
             )
         return await fut
 
@@ -1298,19 +1331,19 @@ class PwSession:
         asyncio.ensure_future(reap())
 
 
-_pw_sessions: dict[str, PwSession] = {}
+_pw_sessions: dict[str, RelaySession] = {}
 _pw_lock = asyncio.Lock()
 
 
-async def pw_get_session(host: str) -> PwSession:
+async def pw_get_session(host: str) -> RelaySession:
     async with _pw_lock:
         session = _pw_sessions.get(host)
         if session is not None and session.alive:
             return session
         if session is not None:
             session.close()
-        url = await pw_endpoint(host)
-        session = PwSession(host, url)
+        url = await mcp_endpoint(host, PW_MCP_PORT)
+        session = RelaySession(host, url, "playwright")
         _pw_sessions[host] = session
         return session
 
@@ -1319,21 +1352,6 @@ def pw_drop(host: str) -> None:
     session = _pw_sessions.pop(host, None)
     if session is not None:
         session.close()
-
-
-def pw_drop_tunnel(host: str) -> None:
-    """Discard the forward without touching the SSH connection under it.
-
-    drop_conn() aborts the whole connection, which is right when SSH itself
-    failed and wrong for everything else: a browser that went away is no reason
-    to kill the exec running next to it.
-    """
-    entry = _tunnels.pop(host, None)
-    if entry is not None:
-        try:
-            entry[1].close()
-        except Exception:
-            pass
 
 
 async def pw_request(host: str, action, timeout: int):
@@ -1372,7 +1390,7 @@ async def pw_request(host: str, action, timeout: int):
             if any(isinstance(c, asyncssh.Error) for c in causes):
                 drop_conn(host)  # SSH really is broken; take the tunnel with it
             else:
-                pw_drop_tunnel(host)
+                drop_tunnels(host, PW_MCP_PORT)
             if not pw_retryable(causes) or attempt == PW_ATTEMPTS:
                 break
             await asyncio.sleep(min(2 ** (attempt - 1), 5))
@@ -1394,6 +1412,115 @@ async def require_playwright(env_id: str) -> str:
         raise ValueError(
             "this environment was created with profile='base'; create one with "
             "profile='playwright' to use the browser"
+        )
+    return target_for(row)
+
+
+# ---- opencode MCP, tunnelled over the same SSH connection ----
+
+_oc_sessions: dict[str, RelaySession] = {}
+_oc_lock = asyncio.Lock()
+
+
+async def oc_get_session(host: str) -> RelaySession:
+    async with _oc_lock:
+        session = _oc_sessions.get(host)
+        if session is not None and session.alive:
+            return session
+        if session is not None:
+            session.close()
+        url = await mcp_endpoint(host, OPENCODE_MCP_PORT)
+        session = RelaySession(host, url, "opencode")
+        _oc_sessions[host] = session
+        return session
+
+
+def oc_drop(host: str) -> None:
+    session = _oc_sessions.pop(host, None)
+    if session is not None:
+        session.close()
+
+
+def oc_hint(causes: list[BaseException]) -> str:
+    if pw_session_lost(causes):
+        return (
+            " -- the bridge restarted and has forgotten the MCP session; the"
+            " next call opens a fresh one"
+        )
+    if any(isinstance(c, asyncssh.Error) for c in causes):
+        return " -- SSH to the environment failed"
+    if any(isinstance(c, httpx.TransportError) for c in causes):
+        return (
+            " -- nothing is listening on the far end of the tunnel;"
+            " `opencode-mcp status` on the box should show the bridge on"
+            " 127.0.0.1:" + str(OPENCODE_MCP_PORT)
+        )
+    return ""
+
+
+async def oc_request(host: str, action, timeout: int):
+    """Run `action(session)` on the environment's opencode bridge session."""
+    last: BaseException | None = None
+    hint = ""
+    for attempt in range(1, PW_ATTEMPTS + 1):
+        try:
+            session = await oc_get_session(host)
+            return await session.submit(action, timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            # Not retried, and not a lost command either: the shell keeps
+            # running on the box, so the answer is to read the rest of it
+            # rather than to start it again.
+            raise RuntimeError(
+                "opencode did not answer within "
+                + str(timeout)
+                + "s. Work started over there keeps running: call opencode_call"
+                + " again with tool='opencode_shell_output' (or 'opencode_result'"
+                + " for an agent run) and the id from the first reply."
+            ) from exc
+        except BaseException as exc:
+            causes = flatten_exc(exc)
+            hint = oc_hint(causes)
+            last = exc
+            log.warning(
+                "opencode attempt %s/%s on %s failed: %s: %s%s",
+                attempt,
+                PW_ATTEMPTS,
+                host,
+                type(exc).__name__,
+                exc,
+                hint,
+            )
+            oc_drop(host)
+            if any(isinstance(c, asyncssh.Error) for c in causes):
+                drop_conn(host)  # SSH really is broken; take the tunnel with it
+            else:
+                drop_tunnels(host, OPENCODE_MCP_PORT)
+            if not pw_retryable(causes) or attempt == PW_ATTEMPTS:
+                break
+            await asyncio.sleep(min(2 ** (attempt - 1), 5))
+    raise RuntimeError(
+        "could not reach the opencode bridge on "
+        + host
+        + ": "
+        + type(last).__name__
+        + ": "
+        + str(last)
+        + hint
+        + " (is the environment on platform='linux-opencode', and finished"
+        + " booting?)"
+    )
+
+
+async def require_opencode(env_id: str) -> str:
+    row = await resolve(env_id)
+    platform = platform_of(row)
+    if platform not in OPENCODE_PLATFORMS:
+        raise ValueError(
+            "this environment is on platform='"
+            + platform
+            + "'; create one with platform='linux-opencode' to use opencode"
         )
     return target_for(row)
 
@@ -1439,6 +1566,12 @@ MCP_KWARGS: dict[str, Any] = {
         "profile='playwright', then call browser_tools(env_id) once to see the "
         "available Playwright tools and their arguments, and browser_call to "
         "invoke them. Everything runs through this one server."
+        "\n\n"
+        "Environments created with platform='linux-opencode' also run the "
+        "opencode coding agent behind an MCP bridge: call opencode_tools(env_id) "
+        "once to see its tools, then opencode_call to invoke them. Its shell "
+        "tools run in a real terminal on the box and long commands keep running "
+        "between calls, which is what exec cannot do."
     ),
     "stateless_http": STATELESS,
     "json_response": JSON_RESPONSE,
@@ -1872,6 +2005,64 @@ async def browser_call(
         return list(result.content)
 
     return await pw_request(host, action, timeout=timeout)
+
+
+@mcp.tool()
+@traced
+async def opencode_tools(env_id: str) -> list[dict[str, Any]]:
+    """List the opencode tools available in this environment.
+
+    Call this once before using opencode_call. The set comes from the bridge
+    running in that environment, so it is authoritative for it rather than
+    baked into this broker. It covers agent runs, a real terminal, file reads,
+    search and permission replies.
+    """
+    host = await require_opencode(env_id)
+
+    async def action(session: ClientSession):
+        listed = await session.list_tools()
+        return [
+            {
+                "name": t.name,
+                "description": (t.description or "").strip(),
+                "input_schema": t.inputSchema,
+            }
+            for t in listed.tools
+        ]
+
+    return await oc_request(host, action, timeout=min(60, SYNC_EXEC_MAX_SECONDS))
+
+
+@mcp.tool()
+@traced
+async def opencode_call(
+    env_id: str,
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+    timeout_seconds: int = 45,
+):
+    """Invoke an opencode tool in this environment.
+
+    `tool` and `arguments` come from opencode_tools, e.g.
+    tool="opencode_shell", arguments={"command": "git status"}. Shell commands
+    run in a real terminal on the box, so exit codes, stderr and interactive
+    programs behave normally and no model is involved. State persists between
+    calls -- the broker holds one MCP session per environment open, and the
+    bridge keeps its shells and agent sessions -- so a command started by one
+    call is read back by the next with tool="opencode_shell_output" and the
+    shell_id it returned. Calls to one environment are served in order.
+    Nothing here replaces exec: that stays the quick way to run one command.
+    """
+    host = await require_opencode(env_id)
+    timeout = sync_timeout(timeout_seconds, "opencode_call")
+    args = arguments or {}
+
+    async def action(session: ClientSession):
+        result = await session.call_tool(tool, args)
+        # Content blocks are handed back untouched, as browser_call does.
+        return list(result.content)
+
+    return await oc_request(host, action, timeout=timeout)
 
 
 @mcp.tool()

@@ -116,7 +116,7 @@ loopback -- the agent on 4096, the bridge on 8788 -- and supervises them from
 the keep-alive loop with per-component restart counters and cooldowns. Neither
 port is published on the tailnet: the broker reaches the bridge through an SSH
 port forward, exactly as it already reaches Playwright MCP, so the shell and
-the agent stay behind one endpoint, one bearer token and one `env_id`.
+the agent stay behind one endpoint and one `env_id`.
 
 ```
 create_env(platform="linux-opencode")                       # shell + agent
@@ -151,6 +151,48 @@ protected nothing and was one more secret to mint, store and leak. Export
 `OPENCODE_MCP_TOKEN` in the workflow if you want the bridge to demand its
 own token anyway: the launcher then passes it to the bridge and sends it on
 its own health and MCP probes.
+
+### Driving opencode from the same MCP
+
+`opencode_tools(env_id)` lists what the bridge in that environment exposes --
+twenty tools today: agent runs (`opencode_start`, `opencode_wait`,
+`opencode_result`, `opencode_abort`), a real terminal (`opencode_shell`,
+`opencode_shell_output`, `opencode_shell_status`, `opencode_shell_list`,
+`opencode_shell_extend`, `opencode_shell_kill`), reading and searching
+(`opencode_read`, `opencode_grep`, `opencode_find_file`, `opencode_diff`) and
+the permission and question queues. `opencode_call(env_id, tool, arguments)`
+invokes one of them:
+
+```
+opencode_tools(env_id)
+opencode_call(env_id, "opencode_shell", {"command": "pytest -x", "wait_seconds": 30})
+opencode_call(env_id, "opencode_shell_output", {"shell_id": "pty_00ce31...", "cursor": 812})
+```
+
+The relay is the one the browser tools already use: an SSH port forward to
+127.0.0.1:8788 on the box, and one long-lived MCP session per environment held
+open by its own task, so state survives between calls and calls to a given
+environment are served in order. Forwards are keyed by `(host, port)` rather
+than by host, so the browser on 8931 and opencode on 8788 can live on the same
+box without either one tearing down the other tunnel when it reconnects. A
+session that dies is reopened on the next call; three attempts, then the error
+says what it found.
+
+None of this replaces `exec`, which stays the quick way to run one command over
+SSH. `opencode_call` earns its keep in two places. Commands that outlive a
+single call: the shell keeps running on the box, and the next call reads the
+rest of it with `opencode_shell_output` and the `shell_id` from the first
+reply. And clients that cannot call tools themselves: one MCP endpoint gives
+them the shell, the file tools and the agent behind it.
+
+The shell tools run in a real pty on the box, so exit codes, stderr and
+progress output are the real ones and no model is involved -- an environment
+with no provider credentials can still be driven end to end this way.
+
+Timeouts nest deliberately: a chat client usually gives up at 60s,
+`sync_timeout` clamps `timeout_seconds` to `SYNC_EXEC_MAX_SECONDS` (50s), and
+the bridge answers within its own 45s wait cap. A slow command therefore comes
+back as `running` with a `shell_id`, not as a failed call.
 
 ## macOS environments
 
