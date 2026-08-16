@@ -96,6 +96,53 @@ Two things to know before relying on it:
 `snapshot/README.md` covers the on-disk format, the exclusion list and the
 tuning variables.
 
+## opencode environments
+
+`create_env(platform="linux-opencode")` dispatches
+`.github/workflows/ephemeral-env-opencode.yml` onto the same `ubuntu-latest`
+runner as `platform="linux"`. Two things differ.
+
+**It is a different host.** The box joins the tailnet as `gha-oc-<id>` rather
+than `gha-env-<id>`. Every other platform shares the `gha-env-` prefix, so
+`tailscale status` now says which workflow built a box, and an opencode
+environment can never be confused with -- or collide with -- a plain one, even
+if both draw the same random id. The prefix is a per-platform table entry
+(`HOST_PREFIXES`), so the next workflow type stays a table edit rather than an
+if/else at every call site.
+
+**It boots the agent.** `scripts/opencode-mcp.sh` installs opencode, builds the
+MCP bridge in front of it (`nmt3325/opencode-mcp-bridge`), starts both on
+loopback -- the agent on 4096, the bridge on 8788 -- and supervises them from
+the keep-alive loop with per-component restart counters and cooldowns. Neither
+port is published on the tailnet: the broker reaches the bridge through an SSH
+port forward, exactly as it already reaches Playwright MCP, so the shell and
+the agent stay behind one endpoint, one bearer token and one `env_id`.
+
+```
+create_env(platform="linux-opencode")                       # shell + agent
+create_env(platform="linux-opencode", profile="playwright") # + browser
+```
+
+Everything a client already knows keeps working unchanged: `exec`, `sudo_exec`,
+`exec_start`/`exec_poll`, the browser tools and `destroy_env` behave exactly as
+they do on `platform="linux"`, because the transport underneath is the same
+Tailscale SSH session.
+
+Credentials for the agent are optional and are never needed to boot. The
+workflow copies whichever of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` or `OPENCODE_AUTH_JSON`
+exist as repository secrets into a 0600 file on the runner, and
+`vars.OPENCODE_MODEL` / `vars.OPENCODE_AGENT` choose the defaults. Without any
+of them the shell, the file tools and the bridge still work; only the tools
+that ask the agent to think need a provider. The credentials live in a file
+rather than in the job environment because the watchdog restarts those
+processes from a later step that cannot see this step's secrets.
+
+The `permission` input (default `allow`) decides whether the agent may run
+shell commands and edit files unattended. `ask` routes every action to the
+bridge's permission tools instead, which is the safer setting if the
+environment is ever pointed at something that is not disposable.
+
 ## macOS environments
 
 `create_env(platform="macos")` dispatches `.github/workflows/ephemeral-env-macos.yml`

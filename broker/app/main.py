@@ -169,6 +169,13 @@ WORKFLOW_FILE_WINDOWS = os.environ.get(
 # pushed back on shutdown, so the next environment starts where the last
 # one stopped instead of rebuilding itself from scratch.
 WORKFLOW_FILE_WARM = os.environ.get("WORKFLOW_FILE_WARM", "warm-env.yml")
+# opencode twin of the Linux workflow: same runner and the same Tailscale SSH
+# contract, but the box also boots the opencode agent and the MCP bridge in
+# front of it, and it joins the tailnet under its own hostname prefix so it is
+# a visibly different host from a plain platform="linux" one.
+WORKFLOW_FILE_OPENCODE = os.environ.get(
+    "WORKFLOW_FILE_OPENCODE", "ephemeral-env-opencode.yml"
+)
 WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
 TAILNET_DOMAIN = os.environ["TAILNET_DOMAIN"]  # e.g. "tail1234.ts.net"
 # GitHub caps how many Actions jobs one account may run at once, and an
@@ -271,6 +278,17 @@ SSH_CONNECT_TIMEOUT = int(os.environ.get("SSH_CONNECT_TIMEOUT", "20"))
 # only through the SSH forward set up below.
 PW_MCP_PORT = int(os.environ.get("PW_MCP_PORT", "8931"))
 
+# Loopback ports the opencode environment binds: the agent's own HTTP server
+# and the MCP bridge in front of it. Neither is published on the tailnet;
+# both are reached through an SSH forward, exactly like Playwright MCP. These
+# must match the values in ephemeral-env-opencode.yml.
+OPENCODE_SERVE_PORT = int(os.environ.get("OPENCODE_SERVE_PORT", "4096"))
+OPENCODE_MCP_PORT = int(os.environ.get("OPENCODE_MCP_PORT", "8788"))
+# Where the environment leaves the bearer token that bridge requires.
+OPENCODE_TOKEN_FILE = os.environ.get(
+    "OPENCODE_TOKEN_FILE", "$HOME/.opencode-mcp-token"
+)
+
 # Hostnames clients may use to reach this broker, comma separated, without a
 # scheme (e.g. "broker.tail1234.ts.net"). See build_transport_security().
 PUBLIC_HOSTS = [
@@ -282,7 +300,7 @@ PUBLIC_HOSTS = [
 API_ROOT = "https://api.github.com"
 ACTIVE_STATES = ("provisioning", "ready")
 HOST_ALPHABET = string.ascii_lowercase + string.digits
-PLATFORMS = ("linux", "linux-warm", "macos", "windows")
+PLATFORMS = ("linux", "linux-warm", "linux-opencode", "macos", "windows")
 # Platforms that carry their state between runs. Only these accept a
 # snapshot name, and only these take a minute or two to shut down.
 SNAPSHOT_PLATFORMS = ("linux-warm",)
@@ -291,6 +309,7 @@ SNAPSHOT_PLATFORMS = ("linux-warm",)
 PROFILES = {
     "linux": ("base", "playwright"),
     "linux-warm": ("base", "playwright"),
+    "linux-opencode": ("base", "playwright"),
     "macos": ("base", "playwright", "xcode"),
     "windows": ("base", "playwright"),
 }
@@ -302,18 +321,21 @@ KEY_AUTH_PLATFORMS = ("macos", "windows")
 WORKFLOW_FILES = {
     "linux": WORKFLOW_FILE,
     "linux-warm": WORKFLOW_FILE_WARM,
+    "linux-opencode": WORKFLOW_FILE_OPENCODE,
     "macos": WORKFLOW_FILE_MACOS,
     "windows": WORKFLOW_FILE_WINDOWS,
 }
 SSH_PORTS = {
     "linux": SSH_PORT,
     "linux-warm": SSH_PORT,
+    "linux-opencode": SSH_PORT,
     "macos": SSH_PORT_MACOS,
     "windows": SSH_PORT_WINDOWS,
 }
 SSH_USERS = {
     "linux": SSH_USER,
     "linux-warm": SSH_USER,
+    "linux-opencode": SSH_USER,
     "macos": SSH_USER,
     "windows": SSH_USER_WINDOWS,
 }
@@ -323,9 +345,23 @@ BOOT_NOTES = {
         "Boot usually takes 3-6 minutes: the snapshot is restored before"
         " the shell opens"
     ),
+    "linux-opencode": (
+        "Boot usually takes 4-7 minutes: opencode is installed and its"
+        " server is answering before the environment reports ready"
+    ),
     "macos": "Boot usually takes 4-8 minutes on macOS",
     "windows": "Boot usually takes 3-6 minutes on Windows",
 }
+# Tailscale hostname prefix per platform. A new workflow type gets its own
+# prefix rather than sharing gha-env-, so `tailscale status` says which
+# workflow built a box, and so two environments that drew the same random id
+# on different workflows can never be mistaken for each other. Everything
+# that predates this table keeps the original prefix.
+HOST_PREFIX = os.environ.get("HOST_PREFIX", "gha-env-")
+HOST_PREFIX_OPENCODE = os.environ.get("HOST_PREFIX_OPENCODE", "gha-oc-")
+HOST_PREFIXES = {"linux-opencode": HOST_PREFIX_OPENCODE}
+# Platforms that boot the opencode agent alongside the shell.
+OPENCODE_PLATFORMS = ("linux-opencode",)
 
 
 class ExecTimeout(RuntimeError):
@@ -500,8 +536,19 @@ def set_state(env_id: str, state: str, ready: bool = False) -> None:
             conn.execute("UPDATE envs SET state=? WHERE env_id=?", (state, env_id))
 
 
-def host_for(host_id: str) -> str:
-    return "gha-env-" + host_id + "." + TAILNET_DOMAIN
+def host_prefix_for(platform: str) -> str:
+    """Tailscale hostname prefix of a platform."""
+    return HOST_PREFIXES.get(platform, HOST_PREFIX)
+
+
+def host_for(host_id: str, platform: str = "linux") -> str:
+    """Tailnet hostname of an environment.
+
+    The prefix is per platform, so the same host_id on two workflow types is
+    two different hosts. Callers that know the row must pass its platform;
+    the default keeps pre-existing behaviour for anything that does not.
+    """
+    return host_prefix_for(platform) + host_id + "." + TAILNET_DOMAIN
 
 
 def platform_of(row: sqlite3.Row) -> str:
@@ -515,8 +562,8 @@ def target_for(row: sqlite3.Row) -> str:
     The SSH layer is keyed by hostname alone, so registering the per-platform
     port, account and key here keeps every call site a one-liner.
     """
-    host = host_for(row["host_id"])
     platform = platform_of(row)
+    host = host_for(row["host_id"], platform)
     user = SSH_USERS.get(platform, SSH_USER)
     if platform in KEY_AUTH_PLATFORMS:
         port = int(row["ssh_port"] or SSH_PORTS[platform])
@@ -584,6 +631,7 @@ async def dispatch_workflow(
     profile: str,
     workflow_file: str = WORKFLOW_FILE,
     extra_inputs: dict[str, str] | None = None,
+    host_prefix: str = HOST_PREFIX,
 ) -> None:
     url = (
         API_ROOT
@@ -612,7 +660,13 @@ async def dispatch_workflow(
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    log.info("dispatching %s for gha-env-%s (%s)", workflow_file, host_id, profile)
+    log.info(
+        "dispatching %s for %s%s (%s)",
+        workflow_file,
+        host_prefix,
+        host_id,
+        profile,
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code not in (202, 204):
@@ -1374,6 +1428,12 @@ MCP_KWARGS: dict[str, Any] = {
         "so packages you install and files you write are still there in the "
         "next environment. Pass snapshot='<name>' to keep independent "
         "snapshots apart, and snapshot_env to checkpoint mid-session.\n\n"
+        "platform='linux-opencode' is that same Ubuntu box with the opencode "
+        "coding agent already installed and running behind its MCP bridge, "
+        "for work you would rather hand to an agent inside the environment "
+        "than drive command by command. It boots under its own hostname "
+        "(gha-oc-...), so it is always a different box from a plain "
+        "platform='linux' one.\n\n"
         "Anything that might run longer than about a minute belongs "
         "in exec_start, which returns a job_id at once, and "
         "exec_poll, which reports whether it finished and hands back "
@@ -1417,6 +1477,11 @@ async def create_env(
     call as exec). macOS boots slower and costs roughly 10x as much to keep
     alive as Linux, Windows about 2x, so only ask for them when you actually
     need them.
+
+    platform="linux-opencode" is the same Ubuntu runner as "linux" with the
+    opencode coding agent installed, served on loopback and supervised. It
+    joins the tailnet as gha-oc-<id> instead of gha-env-<id>, so it is a
+    separate host from every other environment and never collides with one.
 
     profile: "base" (shell only), "playwright" (shell plus a headless Chromium
     driven through browser_call) or, on macOS only, "xcode" (Xcode selected and
@@ -1512,25 +1577,24 @@ async def create_env(
                 key_pem,
             ),
         )
+    # One call site driven by the platform tables. The old three-branch
+    # version fell through to the *default* workflow file for anything that
+    # was neither key-auth nor snapshotted, so a new Linux-family platform
+    # would silently have booted ephemeral-env.yml instead of its own.
+    extra: dict[str, str] = {}
+    if platform in KEY_AUTH_PLATFORMS:
+        extra["ssh_pubkey"] = pubkey or ""
+    if platform in SNAPSHOT_PLATFORMS:
+        extra["snapshot"] = snapshot_name
     try:
-        if platform in KEY_AUTH_PLATFORMS:
-            await dispatch_workflow(
-                host_id,
-                ttl_minutes,
-                profile,
-                workflow_file=WORKFLOW_FILES[platform],
-                extra_inputs={"ssh_pubkey": pubkey or ""},
-            )
-        elif platform in SNAPSHOT_PLATFORMS:
-            await dispatch_workflow(
-                host_id,
-                ttl_minutes,
-                profile,
-                workflow_file=WORKFLOW_FILES[platform],
-                extra_inputs={"snapshot": snapshot_name},
-            )
-        else:
-            await dispatch_workflow(host_id, ttl_minutes, profile)
+        await dispatch_workflow(
+            host_id,
+            ttl_minutes,
+            profile,
+            workflow_file=WORKFLOW_FILES[platform],
+            extra_inputs=extra or None,
+            host_prefix=host_prefix_for(platform),
+        )
     except Exception:
         with db() as conn:
             conn.execute("DELETE FROM envs WHERE env_id = ?", (env_id,))
@@ -1538,7 +1602,7 @@ async def create_env(
 
     return {
         "env_id": env_id,
-        "host": host_for(host_id),
+        "host": host_for(host_id, platform),
         "platform": platform,
         "profile": profile,
         "snapshot": snapshot_name if platform in SNAPSHOT_PLATFORMS else None,
@@ -1897,7 +1961,7 @@ async def list_envs() -> list[dict[str, Any]]:
         ).fetchall()
     return [
         {
-            "host": host_for(r["host_id"]),
+            "host": host_for(r["host_id"], platform_of(r)),
             "state": r["state"],
             "platform": r["platform"],
             "profile": r["profile"],

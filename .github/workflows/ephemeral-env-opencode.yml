@@ -1,0 +1,257 @@
+name: Ephemeral opencode Env (broker-managed)
+
+# The opencode twin of ephemeral-env.yml.
+#
+# Same ubuntu-latest runner, same Tailscale SSH contract, same broker, and the
+# same disposable-per-conversation lifecycle. Two things differ:
+#
+#   * The box joins the tailnet as gha-oc-<env_host> instead of
+#     gha-env-<env_host>. An opencode environment is therefore a visibly
+#     different host from a plain one, `tailscale status` says which workflow
+#     built a box, and the two can never collide even on the same random id.
+#   * It boots the opencode coding agent: `opencode serve` on loopback plus the
+#     MCP bridge in front of it (nmt3325/opencode-mcp-bridge), both supervised
+#     by scripts/opencode-mcp.sh. Neither port is published on the tailnet; the
+#     broker reaches them the way it already reaches Playwright MCP, through an
+#     SSH port forward, so the shell and the agent share one endpoint, one
+#     bearer token and one env_id.
+#
+# ephemeral-env.yml is left completely untouched: anything that wants a plain
+# machine keeps using it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_host:
+        description: "Random lowercase id from the broker. Becomes the Tailscale hostname gha-oc-<env_host>. Not a secret: it is only reachable inside the tailnet."
+        required: true
+      ttl_minutes:
+        description: "Minutes to keep the environment alive (job hard-stops at 6h anyway)"
+        required: false
+        default: "350"
+      profile:
+        description: "base = shell + opencode | playwright = also Playwright MCP"
+        required: false
+        default: "base"
+      opencode_version:
+        description: "opencode release to install, or 'latest'"
+        required: false
+        default: "latest"
+      bridge_ref:
+        description: "Branch or tag of the opencode MCP bridge to build"
+        required: false
+        default: "main"
+      permission:
+        description: "opencode permission mode written into its config: allow = the agent may run bash/edit unattended, ask = every action waits for a reply through the bridge's permission tools"
+        required: false
+        default: "allow"
+
+# Never kill a session that is in use, and never run the same id twice. The
+# group is prefixed like the hostname, so an opencode environment and a plain
+# one with the same id are still two independent runs.
+concurrency:
+  group: gha-oc-${{ inputs.env_host }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ENV_HOST: ${{ inputs.env_host }}
+      PROFILE: ${{ inputs.profile }}
+      TTL_MINUTES: ${{ inputs.ttl_minutes }}
+      PW_MCP_PORT: "8931"
+      PW_MCP_VERSION: "0.0.79"
+      # Must match the broker's OPENCODE_SERVE_PORT / OPENCODE_MCP_PORT.
+      OPENCODE_SERVE_PORT: "4096"
+      OPENCODE_MCP_PORT: "8788"
+      OPENCODE_VERSION: ${{ inputs.opencode_version }}
+      OPENCODE_BRIDGE_REF: ${{ inputs.bridge_ref }}
+      OPENCODE_BRIDGE_REPO: ${{ vars.OPENCODE_BRIDGE_REPO || 'https://github.com/nmt3325/opencode-mcp-bridge.git' }}
+      OPENCODE_PERMISSION: ${{ inputs.permission }}
+
+    steps:
+      - name: Validate env_host
+        run: |
+          if ! printf '%s' "$ENV_HOST" | grep -Eq '^[a-z0-9]{8,32}$'; then
+            echo "::error::env_host must be 8-32 lowercase alphanumeric characters"
+            exit 1
+          fi
+          echo "hostname will be gha-oc-$ENV_HOST"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git and gh to authenticate to GitHub via PAT (for SSH sessions)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_ACTOR: ${{ github.actor }}
+          GIT_USER_NAME: ${{ vars.GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.GIT_USER_EMAIL }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "GH_PAT secret not set; skipping git/gh credential setup"
+          else
+            git config --global credential.helper store
+            GH_LOGIN=$(GH_TOKEN="$GH_PAT" gh api user --jq .login 2>/dev/null || true)
+            GH_UID=$(GH_TOKEN="$GH_PAT" gh api user --jq .id 2>/dev/null || true)
+            : "${GH_LOGIN:=$GH_ACTOR}"
+            if [ -n "${GH_UID:-}" ]; then
+              GH_EMAIL="${GH_UID}+${GH_LOGIN}@users.noreply.github.com"
+            else
+              GH_EMAIL="${GH_LOGIN}@users.noreply.github.com"
+            fi
+            git config --global user.name "${GIT_USER_NAME:-$GH_LOGIN}"
+            git config --global user.email "${GIT_USER_EMAIL:-$GH_EMAIL}"
+            printf 'https://x-access-token:%s@github.com\n' "$GH_PAT" > "$HOME/.git-credentials"
+            chmod 600 "$HOME/.git-credentials"
+            git config --global url."https://github.com/".insteadOf "git@github.com:"
+            git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+            git -C "$GITHUB_WORKSPACE" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git" 2>/dev/null || true
+            echo "git configured for GitHub auth (user: $(git config --global user.name))"
+            if printf '%s' "$GH_PAT" | gh auth login --hostname github.com \
+                 --git-protocol https --with-token; then
+              echo "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo unknown)"
+            else
+              echo "::warning::gh auth login failed; gh CLI stays unauthenticated"
+            fi
+          fi
+
+      - name: Install base packages
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+
+      - name: Setup Node.js
+        # Not conditional on the profile here: the MCP bridge is a Node
+        # program, so every opencode environment needs a runtime.
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Write the opencode environment file
+        # Provider credentials live in one 0600 file rather than in the job
+        # environment, because the processes that need them are detached and
+        # are restarted later by the watchdog, in a step that has no access to
+        # this step's secrets. opencode-mcp.sh sources this file on every
+        # invocation, so a restart gets exactly the same environment as the
+        # original boot. Nothing here is ever echoed.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENCODE_AUTH_JSON: ${{ secrets.OPENCODE_AUTH_JSON }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          OPENCODE_AGENT: ${{ vars.OPENCODE_AGENT }}
+        run: ./scripts/opencode-mcp.sh write-env
+
+      - name: Install opencode and the MCP bridge
+        run: ./scripts/opencode-mcp.sh install
+
+      - name: Install Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: ./scripts/pw-mcp.sh install
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start tailscaled (userspace networking)
+        run: |
+          sudo setsid tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+            --statedir=/var/lib/tailscale < /dev/null > /tmp/tailscaled.log 2>&1 &
+          sleep 5
+
+      - name: Join tailnet as gha-oc-<env_host>
+        run: |
+          # TS_AUTHKEY must be an EPHEMERAL, reusable, pre-approved key, so the
+          # node disappears from the tailnet by itself when the job ends.
+          sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
+            --hostname="gha-oc-$ENV_HOST" --ssh --accept-routes
+          sleep 3
+          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "TS_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "tailnet host: $HOST"
+          # On a name collision Tailscale silently appends "-1" and the broker
+          # would end up talking to the wrong box. Fail loudly instead.
+          case "$HOST" in
+            gha-oc-$ENV_HOST.*) ;;
+            *) echo "::error::hostname collision (got $HOST, expected gha-oc-$ENV_HOST.*)"; exit 1 ;;
+          esac
+
+      - name: Verify Tailscale SSH is accepting
+        run: |
+          for i in $(seq 1 15); do
+            if tailscale status --json | jq -e '.Self.Capabilities // [] | index("ssh")' > /dev/null 2>&1; then
+              echo "tailscale ssh advertised"; break
+            fi
+            sleep 2
+          done
+          tailscale status || true
+
+      - name: Start opencode and the MCP bridge
+        # Returns only once the bridge has answered a real MCP initialize, so
+        # a broken install fails here instead of inside somebody's tool call.
+        run: ./scripts/opencode-mcp.sh start
+
+      - name: Start Playwright MCP (profile=playwright)
+        if: inputs.profile == 'playwright'
+        run: |
+          "$GITHUB_WORKSPACE/scripts/pw-mcp.sh" start
+
+      - name: Announce endpoints
+        run: |
+          echo "=================================================="
+          echo "  Shell          : ssh runner@$TS_HOST   (Tailscale SSH, ACL gated)"
+          echo "  opencode serve : 127.0.0.1:$OPENCODE_SERVE_PORT  (loopback only)"
+          echo "  opencode MCP   : 127.0.0.1:$OPENCODE_MCP_PORT/mcp via SSH forward"
+          echo "  Playwright MCP : 127.0.0.1:$PW_MCP_PORT via SSH forward (profile=playwright)"
+          echo "=================================================="
+          ./scripts/opencode-mcp.sh status || true
+
+      - name: Keep alive
+        run: |
+          MIN="${TTL_MINUTES:-350}"
+          case "$MIN" in ''|*[!0-9]*) MIN=350;; esac
+          [ "$MIN" -le 0 ] && MIN=350
+          [ "$MIN" -gt 350 ] && MIN=350
+          echo "holding environment for $MIN minutes (broker can end it early via /tmp/stop.txt)"
+          END=$(( $(date +%s) + MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if [ -f /tmp/stop.txt ]; then echo "stop.txt detected -- shutting down"; break; fi
+            if ! tailscale status > /dev/null 2>&1; then
+              echo "$(date -Is) tailscaled is not responding"
+            fi
+            # One supervision tick each for the agent stack and the browser.
+            "$GITHUB_WORKSPACE/scripts/opencode-mcp.sh" watchdog || true
+            if [ "$PROFILE" = "playwright" ]; then
+              "$GITHUB_WORKSPACE/scripts/pw-mcp.sh" watchdog || true
+            fi
+            sleep 30
+          done
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p env-logs
+          for f in /tmp/opencode-serve.log /tmp/opencode-mcp.log /tmp/pw-mcp.log /tmp/tailscaled.log; do
+            [ -f "$f" ] && cp "$f" env-logs/ || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-env-logs-${{ inputs.env_host }}-${{ github.run_id }}
+          path: env-logs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: |
+          ./scripts/opencode-mcp.sh stop || true
+          sudo tailscale logout || true

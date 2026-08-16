@@ -15,6 +15,7 @@ GitHub Actions のランナー上に、**Tailscale 経由で接続できるリ�
 | `.github/workflows/vnc.yml` | VNC ベースのデスクトップ（旧構成） |
 | `.github/workflows/ephemeral-env.yml` | broker が起動する使い捨て Linux 環境（`platform="linux"`） |
 | `.github/workflows/warm-env.yml` | 同じく broker から起動するが、overlayfs のスナップショットで**前回の状態を引き継ぐ**環境（`platform="linux-warm"`、詳細は `snapshot/README.md`） |
+| `.github/workflows/ephemeral-env-opencode.yml` | **【新】** broker が起動する **opencode 入り**の使い捨て Linux 環境（`platform="linux-opencode"`）。ランナーも SSH 経路も `ephemeral-env.yml` と同じだが、**ホスト名が `gha-oc-<id>` と別系統**になり、`opencode serve` と MCP ブリッジが常駐する |
 
 ---
 
