@@ -58,7 +58,15 @@ case "$PERMISSION" in
   *) PERMISSION_JSON="{\"bash\":\"$PERMISSION\",\"edit\":\"$PERMISSION\",\"webfetch\":\"$PERMISSION\"}" ;;
 esac
 export OPENCODE_PERMISSION="$PERMISSION_JSON"
-TOKEN_FILE="${OPENCODE_TOKEN_FILE:-$HOME/.opencode-mcp-token}"
+# The bridge listens on loopback only and the single route to it is the broker's
+# SSH forward, which is already authenticated end to end: an env_id at the MCP
+# front door and a tailnet identity on the wire. A second per-host bearer token
+# would only be one more secret to mint, store and leak, so we do not create
+# one. Exporting OPENCODE_MCP_TOKEN puts it back, for the bridge and for the
+# probes below alike.
+TOKEN="${OPENCODE_MCP_TOKEN:-}"
+AUTH_ARGS=()
+[ -n "$TOKEN" ] && AUTH_ARGS=(-H "authorization: Bearer $TOKEN")
 SERVE_LOG="${OPENCODE_SERVE_LOG:-/tmp/opencode-serve.log}"
 MCP_LOG="${OPENCODE_MCP_LOG:-/tmp/opencode-mcp.log}"
 SERVE_PID_FILE="${OPENCODE_SERVE_PID_FILE:-/tmp/opencode-serve.pid}"
@@ -128,14 +136,6 @@ rotate_log() {
   fi
 }
 
-ensure_token() {
-  if [ ! -s "$TOKEN_FILE" ]; then
-    ( umask 077; openssl rand -hex 24 > "$TOKEN_FILE" )
-    say "minted a bridge token in $TOKEN_FILE"
-  fi
-  chmod 600 "$TOKEN_FILE" 2> /dev/null || true
-  TOKEN="$(cat "$TOKEN_FILE")"
-}
 
 # ---------------------------------------------------------------------------
 # health
@@ -162,9 +162,8 @@ serve_health() {
 
 bridge_health() {
   local host code
-  ensure_token
   for host in localhost 127.0.0.1; do
-    code="$(http_code "http://$host:$MCP_PORT/healthz" -H "authorization: Bearer $TOKEN")"
+    code="$(http_code "http://$host:$MCP_PORT/healthz" "${AUTH_ARGS[@]}")"
     if [ "$code" = "404" ]; then
       # A build without /healthz is still fine if it speaks MCP.
       mcp_check "$host" || return 1
@@ -182,11 +181,10 @@ bridge_health() {
 # only this tells them apart.
 mcp_check() {
   local host="${1:-127.0.0.1}" body code
-  ensure_token
   body="$(mktemp)"
   code="$(curl -s -o "$body" -w '%{http_code}' --max-time "$HEALTH_TIMEOUT" \
     -X POST "http://$host:$MCP_PORT/mcp" \
-    -H "authorization: Bearer $TOKEN" \
+    "${AUTH_ARGS[@]}" \
     -H 'content-type: application/json' \
     -H 'accept: application/json, text/event-stream' \
     -H 'mcp-protocol-version: 2025-06-18' \
@@ -291,7 +289,6 @@ start_bridge() {
   fi
   [ -n "${pid:-}" ] && stop_one "bridge" "$MCP_PID_FILE" "$MCP_PORT"
   [ -f "$BRIDGE_DIR/dist/index.js" ] || { say "ERROR bridge is not built; run '$0 install'"; return 1; }
-  ensure_token
   rotate_log "$MCP_LOG"
   say "starting the MCP bridge on 127.0.0.1:$MCP_PORT"
   OPENCODE_BASE_URL="http://127.0.0.1:$SERVE_PORT" \
@@ -396,7 +393,7 @@ install_bridge() {
   say "bridge built at $BRIDGE_DIR (commit $(git -C "$BRIDGE_DIR" rev-parse --short HEAD))"
 }
 
-install() { install_opencode && install_bridge && ensure_token; }
+install() { install_opencode && install_bridge; }
 
 # Persist everything the detached processes need. The watchdog restarts them
 # from a step that cannot see this job's secrets, so "in the environment right
@@ -424,13 +421,16 @@ write_env() {
 }
 
 status() {
-  ensure_token
   echo "opencode serve : port $SERVE_PORT pid $(server_pid "$SERVE_PID_FILE" "$SERVE_PORT" || echo none)"
   echo "mcp bridge     : port $MCP_PORT pid $(server_pid "$MCP_PID_FILE" "$MCP_PORT" || echo none)"
   echo "binary         : $(resolve_opencode && echo "$OPENCODE_BIN" || echo 'not installed')"
   echo "bridge         : $BRIDGE_DIR ($BRIDGE_REF)"
   echo "workdir        : $WORKDIR"
-  echo "token file     : $TOKEN_FILE"
+  if [ -n "$TOKEN" ]; then
+    echo "auth           : bearer token from OPENCODE_MCP_TOKEN"
+  else
+    echo "auth           : none, loopback only"
+  fi
   echo "logs           : $SERVE_LOG $MCP_LOG"
   echo "restarts       : serve=$(num "$(counter restarts-serve)") bridge=$(num "$(counter restarts-bridge)")"
   if serve_health; then echo "serve health   : ok"; else echo "serve health   : FAILING"; fi

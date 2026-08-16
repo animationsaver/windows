@@ -284,10 +284,6 @@ PW_MCP_PORT = int(os.environ.get("PW_MCP_PORT", "8931"))
 # must match the values in ephemeral-env-opencode.yml.
 OPENCODE_SERVE_PORT = int(os.environ.get("OPENCODE_SERVE_PORT", "4096"))
 OPENCODE_MCP_PORT = int(os.environ.get("OPENCODE_MCP_PORT", "8788"))
-# Where the environment leaves the bearer token that bridge requires.
-OPENCODE_TOKEN_FILE = os.environ.get(
-    "OPENCODE_TOKEN_FILE", "$HOME/.opencode-mcp-token"
-)
 
 # Hostnames clients may use to reach this broker, comma separated, without a
 # scheme (e.g. "broker.tail1234.ts.net"). See build_transport_security().

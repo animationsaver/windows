@@ -143,6 +143,15 @@ shell commands and edit files unattended. `ask` routes every action to the
 bridge's permission tools instead, which is the safer setting if the
 environment is ever pointed at something that is not disposable.
 
+The bridge and the agent both bind to loopback, and the only route to them
+is the broker's SSH forward, so there is no second bearer token on the box.
+The `env_id` you already present to this broker is the authentication and
+the tailnet identity is the transport; a per-host token on top of that
+protected nothing and was one more secret to mint, store and leak. Export
+`OPENCODE_MCP_TOKEN` in the workflow if you want the bridge to demand its
+own token anyway: the launcher then passes it to the bridge and sends it on
+its own health and MCP probes.
+
 ## macOS environments
 
 `create_env(platform="macos")` dispatches `.github/workflows/ephemeral-env-macos.yml`
