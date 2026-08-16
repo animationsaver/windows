@@ -49,6 +49,15 @@ BRIDGE_REPO="${OPENCODE_BRIDGE_REPO:-https://github.com/nmt3325/opencode-mcp-bri
 BRIDGE_REF="${OPENCODE_BRIDGE_REF:-main}"
 VERSION="${OPENCODE_VERSION:-latest}"
 PERMISSION="${OPENCODE_PERMISSION:-allow}"
+# opencode parses OPENCODE_PERMISSION as JSON, so exporting the bare word that
+# arrives from the workflow input makes it log "contains invalid JSON, skipping"
+# and silently keep its own defaults. Keep the short form for our messages and
+# hand opencode the object form, in both the env var and the config file.
+case "$PERMISSION" in
+  '{'*) PERMISSION_JSON="$PERMISSION" ;;
+  *) PERMISSION_JSON="{\"bash\":\"$PERMISSION\",\"edit\":\"$PERMISSION\",\"webfetch\":\"$PERMISSION\"}" ;;
+esac
+export OPENCODE_PERMISSION="$PERMISSION_JSON"
 TOKEN_FILE="${OPENCODE_TOKEN_FILE:-$HOME/.opencode-mcp-token}"
 SERVE_LOG="${OPENCODE_SERVE_LOG:-/tmp/opencode-serve.log}"
 MCP_LOG="${OPENCODE_MCP_LOG:-/tmp/opencode-mcp.log}"
@@ -250,14 +259,10 @@ write_config() {
   cat > "$cfg" <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
-  "permission": {
-    "bash": "$PERMISSION",
-    "edit": "$PERMISSION",
-    "webfetch": "$PERMISSION"
-  }
+  "permission": $PERMISSION_JSON
 }
 JSON
-  say "wrote $cfg with permission=$PERMISSION"
+  say "wrote $cfg with permission=$PERMISSION_JSON"
 }
 
 start_serve() {
