@@ -755,11 +755,6 @@ def drop_conn(host: str) -> None:
     pw_drop(host)
     oc_drop(host)
     drop_tunnels(host)
-    if entry is not None:
-        try:
-            entry[1].close()
-        except Exception:
-            pass
     conn = _conns.pop(host, None)
     if conn is not None:
         log.debug("dropping ssh connection to %s", host)

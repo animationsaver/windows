@@ -129,7 +129,8 @@ jobs:
         # program, so every opencode environment needs a runtime.
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # The PTY relay uses the global WebSocket API, available in Node 22+.
+          node-version: "22"
 
       - name: Write the opencode environment file
         # Provider credentials live in one 0600 file rather than in the job
