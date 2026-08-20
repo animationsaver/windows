@@ -1,0 +1,72 @@
+name: Warm the environment caches
+
+# The environment workflows only *restore* caches, never save them, for two
+# reasons:
+#
+#   * actions/cache writes its entry in a post step, which in those workflows
+#     runs when the environment is torn down -- up to six hours after the
+#     entry was needed, with a "Keep alive" loop in between.
+#   * Several environments can be alive at once. They would all try to save
+#     the same key at the same moment and all but one would log a collision.
+#
+# So this workflow is the only writer. It installs exactly what an
+# environment installs, with the same script and the same pinned version, and
+# saves the result under the key the environments look up.
+#
+# Caches are branch-scoped: an entry written here on main is visible to runs
+# on main (which is the ref the broker dispatches) and to branches cut from
+# it, but an entry written on a feature branch is invisible to main. Keep
+# this workflow on main.
+
+on:
+  schedule:
+    # Twice a day: GitHub evicts entries that go untouched for 7 days, and a
+    # miss only costs an environment the install it used to do anyway.
+    - cron: "17 2,14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required by the delete below. actions/cache/save cannot overwrite a key,
+  # so without a delete the entry would freeze at whatever the first
+  # successful run happened to write.
+  actions: write
+
+concurrency:
+  group: cache-warm
+  cancel-in-progress: true
+
+jobs:
+  playwright-browsers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Must match ephemeral-env.yml. If these drift the environments look up
+      # a key this job never writes and silently install from scratch.
+      PW_MCP_VERSION: "0.0.79"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the pinned server and the browser it asks for
+        # Deliberately the same script and the same defaults an environment
+        # uses, so the cache holds the browser build this exact server
+        # demands rather than whatever "npx playwright install" resolves.
+        run: ./scripts/pw-mcp.sh install
+
+      - name: Drop the previous entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: pw-browsers-${{ env.PW_MCP_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+        run: gh cache delete "$KEY" --repo "$GITHUB_REPOSITORY" || echo "no existing entry to drop"
+
+      - name: Save the browser cache
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-browsers-${{ env.PW_MCP_VERSION }}-${{ runner.os }}-${{ runner.arch }}

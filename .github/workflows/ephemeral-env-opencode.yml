@@ -18,6 +18,13 @@ name: Ephemeral opencode Env (broker-managed)
 #
 # ephemeral-env.yml is left completely untouched: anything that wants a plain
 # machine keeps using it.
+#
+# The boot-latency fixes from ephemeral-env.yml apply here too and are kept
+# byte-identical on purpose: the ssh-capability check that burned its full 30s
+# timeout on every single boot, the apt step that installed a package already
+# in the image, the static Tailscale tarball instead of an apt repo plus a
+# second apt-get update, and the two fixed sleeps replaced by polls. The
+# measurements are in that file s header.
 
 on:
   workflow_dispatch:
@@ -119,10 +126,19 @@ jobs:
             fi
           fi
 
-      - name: Install base packages
+      - name: Ensure jq is present
         run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+          # jq ships with ubuntu-latest (1.7.1 on 24.04), so the old
+          # unconditional update+install spent 5-10s per boot re-indexing apt
+          # to install a package that was already there -- apt history.log
+          # recorded no transaction for it at all. Only pay that cost if a
+          # future image really drops jq.
+          if command -v jq > /dev/null 2>&1; then
+            echo "jq $(jq --version) already present; skipping apt"
+          else
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq
+          fi
 
       - name: Setup Node.js
         # Not conditional on the profile here: the MCP bridge is a Node
@@ -158,13 +174,49 @@ jobs:
         run: ./scripts/pw-mcp.sh install
 
       - name: Install Tailscale
-        run: curl -fsSL https://tailscale.com/install.sh | sh
+        env:
+          # Bump to move the whole fleet. This is the version the apt path was
+          # installing anyway, and the fallback below covers a pulled release.
+          TS_VERSION: "1.102.3"
+        run: |
+          # install.sh adds the Tailscale apt repo and then runs a *second*
+          # full apt-get update before installing: 8-12s measured. The
+          # official static tarball is the same two binaries, 2.3s to fetch
+          # 38MB plus 0.5s to untar on this image. install.sh stays as the
+          # fallback so a pulled release or an unreachable pkgs.tailscale.com
+          # cannot stop an environment from booting.
+          if curl -fsSL --max-time 60 -o /tmp/tailscale.tgz \
+               "https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_amd64.tgz" \
+             && mkdir -p /tmp/tailscale-static \
+             && tar -xzf /tmp/tailscale.tgz -C /tmp/tailscale-static --strip-components=1 \
+             && sudo install -m 0755 /tmp/tailscale-static/tailscale /usr/local/bin/tailscale \
+             && sudo install -m 0755 /tmp/tailscale-static/tailscaled /usr/local/sbin/tailscaled; then
+            echo "TS_DAEMON=/usr/local/sbin/tailscaled" >> "$GITHUB_ENV"
+            echo "static install: $(tailscale version | head -1)"
+          else
+            echo "::warning::static tailscale install failed; falling back to install.sh"
+            curl -fsSL https://tailscale.com/install.sh | sh
+            echo "TS_DAEMON=tailscaled" >> "$GITHUB_ENV"
+          fi
 
       - name: Start tailscaled (userspace networking)
         run: |
-          sudo setsid tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+          sudo setsid "${TS_DAEMON:-tailscaled}" --tun=userspace-networking --socks5-server=localhost:1055 \
             --statedir=/var/lib/tailscale < /dev/null > /tmp/tailscaled.log 2>&1 &
-          sleep 5
+          # The old "sleep 5" was a guess at how long the daemon needs. Wait
+          # for the control socket it actually has to create, and fail loudly
+          # with the log instead of walking into a confusing "tailscale up"
+          # error if it never shows up.
+          for i in $(seq 1 150); do
+            [ -S /var/run/tailscale/tailscaled.sock ] && break
+            sleep 0.1
+          done
+          if [ ! -S /var/run/tailscale/tailscaled.sock ]; then
+            echo "::error::tailscaled never created /var/run/tailscale/tailscaled.sock"
+            cat /tmp/tailscaled.log || true
+            exit 1
+          fi
+          echo "tailscaled socket ready"
 
       - name: Join tailnet as gha-oc-<env_host>
         run: |
@@ -172,8 +224,19 @@ jobs:
           # node disappears from the tailnet by itself when the job ends.
           sudo tailscale up --authkey="${{ secrets.TS_AUTHKEY }}" \
             --hostname="gha-oc-$ENV_HOST" --ssh --accept-routes
-          sleep 3
-          HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          # "tailscale up" returns once the node is authenticated, but
+          # .Self.DNSName can lag it by a moment, which is what the old
+          # "sleep 3" was covering blind. Poll for the name instead.
+          HOST=""
+          for i in $(seq 1 100); do
+            HOST=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+            [ -n "$HOST" ] && break
+            sleep 0.1
+          done
+          if [ -z "$HOST" ]; then
+            echo "::error::tailscale never reported a DNSName for this node"
+            exit 1
+          fi
           echo "TS_HOST=$HOST" >> "$GITHUB_ENV"
           echo "tailnet host: $HOST"
           # On a name collision Tailscale silently appends "-1" and the broker
@@ -185,12 +248,30 @@ jobs:
 
       - name: Verify Tailscale SSH is accepting
         run: |
-          for i in $(seq 1 15); do
-            if tailscale status --json | jq -e '.Self.Capabilities // [] | index("ssh")' > /dev/null 2>&1; then
-              echo "tailscale ssh advertised"; break
+          # Confirms the ACL actually grants ssh to this node. Failing here is
+          # far easier to diagnose than a broker timeout ten minutes later.
+          #
+          # Tailscale reports this capability as a URL, both as an element of
+          # .Self.Capabilities and as a .Self.CapMap key:
+          #   "https://tailscale.com/cap/ssh"
+          # The old test was jq index("ssh"), which only matches an exact
+          # "ssh" element, so it never matched on a current client: this step
+          # spent its full 30s timeout in 14 of 14 sampled runs and never once
+          # printed "tailscale ssh advertised". Accept the historical bare
+          # form or any .../cap/ssh URL, and poll 4x faster.
+          ok=""
+          for i in $(seq 1 40); do
+            if tailscale status --json 2>/dev/null \
+                 | jq -e '[((.Self.CapMap // {}) | keys[]), ((.Self.Capabilities // [])[])] | any(. == "ssh" or endswith("/cap/ssh"))' > /dev/null 2>&1; then
+              ok=1
+              echo "tailscale ssh advertised"
+              break
             fi
-            sleep 2
+            sleep 0.5
           done
+          if [ -z "$ok" ]; then
+            echo "::warning::tailscale never advertised an ssh capability; check that the tailnet ACL grants ssh to this node"
+          fi
           tailscale status || true
 
       - name: Start opencode and the MCP bridge
